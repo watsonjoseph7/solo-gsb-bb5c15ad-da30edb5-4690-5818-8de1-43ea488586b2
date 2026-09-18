@@ -1,4 +1,15 @@
-import type { AppData, AssignmentSuccess, StressTestReport } from './types'
+import type { AppData, AssignmentSuccess, PlanDifference, StressTestReport } from './types'
+
+export interface PlanExportMeta {
+  /** 方案序号（从 1 开始的人类可读序号；首方案为 1） */
+  planIndex: number
+  /** 本次生成请求的方案总数（1～3） */
+  requestedCount: number
+  /** 用户输入的最小差异 N（单方案导出为 0） */
+  minDifference: number
+  /** 相对其他方案（重点是首方案）的差异统计 */
+  differences: PlanDifference[]
+}
 
 export interface ExportPayload {
   exportedAt: string
@@ -6,6 +17,8 @@ export interface ExportPayload {
   manuallyAdjusted: boolean
   /** 累计执行的一换一互换次数 */
   swapCount: number
+  /** 备选方案元信息：方案序号、请求数量、差异门槛与相对各方案的差异统计（单方案时为方案 1/1） */
+  plan: PlanExportMeta
   summary: AssignmentSuccess['objective']
   assignments: Array<{
     paperId: string
@@ -30,13 +43,22 @@ export interface ExportPayload {
   }>
 }
 
-export function buildExportPayload(data: AppData, result: AssignmentSuccess): ExportPayload {
+export function buildExportPayload(data: AppData, result: AssignmentSuccess, planMeta?: PlanExportMeta): ExportPayload {
   const paperMap = new Map(data.papers.map((p) => [p.id, p]))
   const reviewerMap = new Map(data.reviewers.map((r) => [r.id, r]))
+  // 多方案模式由调用方显式传入方案元信息；旧调用方式（仅传成功结果）缺省为“方案 1/1、无差异统计”。
+  // 入参一律使用内部从 0 开始的方案序号，导出时统一转成从 1 开始，便于人工阅读。
+  const internal: PlanExportMeta = planMeta ?? { planIndex: 0, requestedCount: 1, minDifference: 0, differences: [] }
+  const plan: PlanExportMeta = {
+    ...internal,
+    planIndex: internal.planIndex + 1,
+    differences: internal.differences.map((d) => ({ ...d, otherPlanIndex: d.otherPlanIndex + 1 }))
+  }
   return {
     exportedAt: new Date().toISOString(),
     manuallyAdjusted: result.manuallyAdjusted === true,
     swapCount: result.swapCount ?? 0,
+    plan,
     summary: result.objective,
     assignments: result.assignments.map((a) => ({
       paperId: a.paperId,

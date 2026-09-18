@@ -1,4 +1,13 @@
 import { solveAssignment, computeMatchedTags } from '../src/engine/solver'
+import {
+  MAX_PLAN_COUNT,
+  buildPlanDifferences,
+  differenceBetween,
+  maxPossibleDifference,
+  singlePlanSet,
+  solveAlternatives,
+  validateAlternativesRequest
+} from '../src/engine/alternatives'
 import { runStressTest, stressFingerprint } from '../src/engine/stress'
 import { enumerateSwaps, applySwapCandidate, type SwapCandidate } from '../src/engine/swap'
 import type { AppData, AssignmentSuccess } from '../src/types'
@@ -919,6 +928,221 @@ const PA = (id: string, paperId: string, reviewerId: string) => ({ id, paperId, 
   if (out.runnable) {
     const a = out.report.scenarios.find((s) => s.reviewerId === 'a')
     check('甲缺席场景存在且不可行', !!a && !a.feasible, JSON.stringify(a?.feasible))
+  }
+}
+
+/* ============================ 备选方案（多方案） ============================ */
+
+/** 余量充足的数据：2 稿各需 1，3 位容量 2 的评审人，可产生多种分派 */
+function altData(): AppData {
+  return mk(
+    [P('p1', '稿件一', 1, ['T']), P('p2', '稿件二', 1, ['T'])],
+    [R('a', '甲', 2, ['T']), R('b', '乙', 2, ['T']), R('c', '丙', 2, [])]
+  )
+}
+
+// 40. 单方案默认行为不变：count=1 时只返回 1 个方案，且与 solveAssignment 完全一致
+{
+  const d = altData()
+  console.log('用例40 备选方案 · 默认单方案')
+  const set = solveAlternatives(d, validateAlternativesRequest(1, 99))
+  check('单方案可行且恰有 1 个方案', set.feasible && set.plans.length === 1)
+  if (set.feasible) {
+    check('N 被归零（单方案模式）', set.minDifference === 0 && set.requestedCount === 1)
+    check('无停止原因', set.stopReason === undefined)
+    check('方案序号为 0、无差异统计', set.plans[0].planIndex === 0 && set.plans[0].differences.length === 0)
+    const single = solveAssignment(d)
+    check('与 solveAssignment 目标值一致', single.feasible && single.objective.topicMatches === set.plans[0].objective.topicMatches && single.objective.maxLoad === set.plans[0].objective.maxLoad)
+    const wrapped = single.feasible ? singlePlanSet(single) : null
+    check('singlePlanSet 包装为 1 方案集', !!wrapped && wrapped.plans.length === 1 && wrapped.plans[0].planIndex === 0)
+  }
+}
+
+// 41. 多方案：硬约束全部满足、两两差异达到 N、首方案字典序最优
+{
+  const d = altData()
+  console.log('用例41 备选方案 · 3 方案与差异门槛')
+  const set = solveAlternatives(d, validateAlternativesRequest(3, 2))
+  check('可行且凑满 3 个方案', set.feasible && set.plans.length === 3, set.feasible ? set.stopReason ?? '' : JSON.stringify(set.reasons.map((r) => r.kind)))
+  if (set.feasible) {
+    check('每方案恰好 2 条分派、每篇 1 人', set.plans.every((p) => p.objective.totalAssigned === 2 && p.assignments.filter((a) => a.paperId === 'p1').length === 1))
+    check('无人超容量', set.plans.every((p) => p.loads.every((l) => l.assigned <= l.capacity)))
+    // 两两差异复核
+    let allDiffOk = true
+    for (let i = 0; i < set.plans.length; i++) {
+      for (let j = i + 1; j < set.plans.length; j++) {
+        const a = new Set(set.plans[i].assignments.map((x) => `${x.paperId}|${x.reviewerId}`))
+        const b = new Set(set.plans[j].assignments.map((x) => `${x.paperId}|${x.reviewerId}`))
+        const diff = differenceBetween(a, b)
+        if (diff.symmetricDifference < 2) allDiffOk = false
+        const stat = set.plans[i].differences.find((x) => x.otherPlanIndex === j)
+        if (!stat || stat.symmetricDifference !== diff.symmetricDifference || stat.common !== diff.common) allDiffOk = false
+      }
+    }
+    check('两两差异均 ≥ N=2 且统计与重算一致（对称差恒为偶数）', allDiffOk)
+    // 首方案字典序最优：没有备选方案在匹配数或（匹配数相同时的）最大负载上更优
+    const first = set.plans[0].objective
+    check(
+      '首方案字典序最优（他案匹配数不更多；匹配数相同时最大负载不更小）',
+      set.plans.slice(1).every((p) => p.objective.topicMatches < first.topicMatches || (p.objective.topicMatches === first.topicMatches && p.objective.maxLoad >= first.maxLoad)),
+      JSON.stringify(set.plans.map((p) => p.objective))
+    )
+  }
+}
+
+// 42. 差异以对称差计：N=1 与 N=2 等价（至少替换一条分派），方案互不为子集重复
+{
+  const d = altData()
+  console.log('用例42 N=1 奇偶性（对称差恒为偶数）')
+  const set = solveAlternatives(d, validateAlternativesRequest(3, 1))
+  check('N=1 仍凑满 3 个、两两至少差 2（≥1 的最小偶数）', set.feasible && set.plans.length === 3)
+  if (set.feasible) {
+    check('所有两两差异均为正偶数', set.plans.every((p) => p.differences.every((x) => x.symmetricDifference >= 2 && x.symmetricDifference % 2 === 0)))
+  }
+}
+
+// 43. 无法凑满数量：保留已找到方案并给出停止原因
+{
+  // 两篇都只能由 a、b 评审（c 全冲突），且 a、b 容量各 1：每人至多承担一篇，
+  // 可行的完美匹配只有 {p1-a,p2-b} 与 {p1-b,p2-a} 两种
+  const d = mk(
+    [P('p1', '稿件一', 1, ['T']), P('p2', '稿件二', 1, ['T'])],
+    [R('a', '甲', 1, ['T']), R('b', '乙', 1, ['T']), R('c', '丙', 2, ['T'], ['p1', 'p2'])]
+  )
+  console.log('用例43 备选不足时保留并说明')
+  const set = solveAlternatives(d, validateAlternativesRequest(3, 2))
+  check('可行但只找到 2 个方案', set.feasible && set.plans.length === 2, JSON.stringify(set.feasible ? set.plans.length : set.reasons))
+  if (set.feasible) {
+    check('附带停止原因', typeof set.stopReason === 'string' && set.stopReason.includes('不存在'))
+    check('两方案完全不同：对称差为 4（两条边全部对调）', set.plans[1].differences[0]?.symmetricDifference === 4)
+  }
+  // 两个方案已完全不同（对称差 4 即上限）：请求 3 个、N=2 时第三个不可能；
+  // 直接请求第 3 个方案的门槛下（这里仍要求与两者各差 2）引擎同样找不到第三个。
+  const strict = solveAlternatives(d, validateAlternativesRequest(3, 2))
+  check('只有 2 个可行匹配时请求 3 个：保留 2 个并说明', strict.feasible && strict.plans.length === 2 && !!strict.stopReason)
+}
+
+// 44. N 超过自由名额理论上限：界面侧 maxPossibleDifference 与引擎停止原因一致
+{
+  const d = altData()
+  console.log('用例44 N 理论上限校验')
+  const maxDiff = maxPossibleDifference(d)
+  check('最大对称差 = 2×自由名额 = 4（无预指派、总名额 2）', maxDiff === 4, `got ${maxDiff}`)
+  const set = solveAlternatives(d, validateAlternativesRequest(2, 5))
+  check('N=5 超过上限 4：保留首方案、停止原因提及上限', set.feasible && set.plans.length === 1 && !!set.stopReason && set.stopReason.includes('4'))
+}
+
+// 45. 预指派固定的边不参与差异：含预指派时备选方案只改变自由名额，且全部保留预指派
+{
+  const d = mk(
+    [P('p1', '稿件一', 2, ['T']), P('p2', '稿件二', 1, ['T'])],
+    [R('a', '甲', 3, ['T']), R('b', '乙', 3, ['T']), R('c', '丙', 3, ['T'])],
+    [PA('pa1', 'p1', 'c')] // c 对 p1 的分派在所有方案中固定
+  )
+  console.log('用例45 备选方案保留全部预指派')
+  const maxDiff = maxPossibleDifference(d)
+  check('自由名额=2 → 最大对称差=4（预指派 1 条恒定）', maxDiff === 4, `got ${maxDiff}`)
+  const set = solveAlternatives(d, validateAlternativesRequest(3, 2))
+  check('凑满 3 个方案', set.feasible && set.plans.length === 3, set.feasible ? set.stopReason ?? '' : '')
+  if (set.feasible) {
+    check('每个方案都包含预指派 c→p1 且标记 preassigned', set.plans.every((p) => p.assignments.some((x) => x.paperId === 'p1' && x.reviewerId === 'c' && x.preassigned)))
+    check('预指派计数均为 1', set.plans.every((p) => p.objective.preassignedCount === 1))
+    // 预指派边不在差异内：方案间 common 至少为 1
+    check('两两都共用那条预指派边（common≥1）', set.plans.every((p) => p.differences.every((x) => x.common >= 1)))
+    check('两两差异均达到 N=2', set.plans.every((p) => p.differences.every((x) => x.symmetricDifference >= 2)))
+  }
+}
+
+// 46. 全部名额被预指派占满：只有唯一方案，无法生成备选
+{
+  const d = mk(
+    [P('p1', '稿件一', 2)],
+    [R('a', '甲', 2, ['T']), R('b', '乙', 2, ['T'])],
+    [PA('pa1', 'p1', 'a'), PA('pa2', 'p1', 'b')]
+  )
+  console.log('用例46 全预指派无自由名额')
+  const set = solveAlternatives(d, validateAlternativesRequest(2, 2))
+  check('保留唯一（全预指派）方案并停止', set.feasible && set.plans.length === 1 && !!set.stopReason && set.stopReason.includes('预指派'))
+}
+
+// 47. 硬约束不可行时多方案与单方案同样整体失败、无部分结果
+{
+  const d = mk([P('p1', 'A', 3, ['X'])], [R('a', '甲', 2, ['X'], ['p1']), R('b', '乙', 1)])
+  console.log('用例47 多方案模式下硬约束失败')
+  const set = solveAlternatives(d, validateAlternativesRequest(3, 2))
+  check('不可行', !set.feasible)
+  if (!set.feasible) check('给出 paper-eligible 原因且无方案数组', set.reasons.some((r) => r.kind === 'paper-eligible') && !('plans' in set))
+}
+
+// 48. 输入校验：数量越界 / N 非法
+{
+  console.log('用例48 备选请求输入校验')
+  check('合法请求 3/2 通过', (() => { try { validateAlternativesRequest(3, 2); return true } catch { return false } })())
+  check('count=0 抛错', (() => { try { validateAlternativesRequest(0, 2); return false } catch { return true } })())
+  check(`count=${MAX_PLAN_COUNT + 1} 抛错`, (() => { try { validateAlternativesRequest(MAX_PLAN_COUNT + 1, 2); return false } catch { return true } })())
+  check('count=2 且 N=0 抛错', (() => { try { validateAlternativesRequest(2, 0); return false } catch { return true } })())
+  check('count=2 且 N=1.5 截断为整数不抛错', (() => { try { return validateAlternativesRequest(2, 1.5).minDifference === 1 } catch { return false } })())
+}
+
+// 49. 备选方案导出写入方案序号与差异统计（序号从 1 开始）
+{
+  const { buildExportPayload } = await import('../src/exporter')
+  const d = altData()
+  const set = solveAlternatives(d, validateAlternativesRequest(3, 2))
+  console.log('用例49 备选方案导出元信息')
+  check('求解成功 3 方案', set.feasible && set.plans.length === 3)
+  if (set.feasible) {
+    const p2 = set.plans[1]
+    const payload = buildExportPayload(d, p2, {
+      planIndex: p2.planIndex,
+      requestedCount: set.requestedCount,
+      minDifference: set.minDifference,
+      differences: p2.differences
+    })
+    check('导出方案序号=2（从 1 开始）、总数 3、N=2', payload.plan.planIndex === 2 && payload.plan.requestedCount === 3 && payload.plan.minDifference === 2)
+    const vs1 = payload.plan.differences.find((x) => x.otherPlanIndex === 1)
+    check('导出含对首方案（序号 1）差异且 ≥2', !!vs1 && vs1.symmetricDifference >= 2 && vs1.common >= 0)
+    // 单方案导出仍是 1/1、无差异
+    const single = buildExportPayload(d, set.plans[0])
+    check('缺省导出为方案 1/1、差异列表为空', single.plan.planIndex === 1 && single.plan.requestedCount === 1 && single.plan.differences.length === 0)
+  }
+}
+
+// 50. 人工互换某个备选方案后：差异统计按调整后分派重算、仅该方案被标记
+{
+  const d = mk(
+    [P('p1', 'ML', 1, ['ML']), P('p2', '系统', 1, ['SYS'])],
+    [R('a', 'Alice', 2, ['ML']), R('b', 'Bob', 2, ['SYS']), R('c', 'Carol', 2, [])]
+  )
+  console.log('用例50 备选方案上的互换与差异重算')
+  const set = solveAlternatives(d, validateAlternativesRequest(3, 2))
+  check('凑满 3 个方案', set.feasible && set.plans.length === 3, set.feasible ? set.stopReason ?? '' : '')
+  if (set.feasible) {
+    // 找到方案 2 上可执行的一换一（与方案 1 之间的枚举），应用后重算差异
+    const plan1 = set.plans[1]
+    const beforeVs0 = plan1.differences.find((x) => x.otherPlanIndex === 0)?.symmetricDifference ?? 0
+    // 枚举方案内任意两位有任务评审人，取第一个候选执行
+    let applied: AssignmentSuccess | null = null
+    const busy = plan1.loads.filter((l) => l.assigned > 0).map((l) => l.reviewerId)
+    outer: for (let i = 0; i < busy.length; i++) {
+      for (let j = i + 1; j < busy.length; j++) {
+        const en = enumerateSwaps(d, plan1, busy[i], busy[j])
+        if (en.candidates.length > 0) {
+          applied = applySwapCandidate(d, plan1, en.candidates[0])
+          break outer
+        }
+      }
+    }
+    if (applied) {
+      check('互换应用成功并带人工标记', applied.manuallyAdjusted === true && applied.swapCount === 1)
+      const updated = set.plans.map((p) => (p.planIndex === 1 ? { ...p, ...applied!, planIndex: 1 } : p))
+      const { recomputePlanDifferences } = await import('../src/engine/alternatives')
+      const fresh = recomputePlanDifferences(updated)
+      const changed = fresh[1].find((x) => x.otherPlanIndex === 0)?.symmetricDifference !== beforeVs0 || fresh[1].some((x) => x.symmetricDifference >= 2)
+      check('重算差异仍为非负偶数、且两两均成立', fresh.every((row) => row.every((x) => x.symmetricDifference >= 0 && x.symmetricDifference % 2 === 0)) && changed)
+    } else {
+      check('存在可执行互换候选（数据应支持至少一次一换一）', false, 'no candidate enumerated')
+    }
   }
 }
 

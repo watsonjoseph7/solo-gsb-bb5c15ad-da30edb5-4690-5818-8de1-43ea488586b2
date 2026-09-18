@@ -394,11 +394,59 @@ export function solveAssignment(rawData: AppData): AssignmentResult {
     return { feasible: false, reasons: hc.reasons }
   }
 
-  // ---- 硬约束可行：用整数规划做目标优化（预指派关系作为强制变量） ----
-  return optimize(hc.papers, hc.reviewers, hc.eligible, hc.organizations, hc.demands, hc.totalRequired, hc.forced)
+  // ---- 硬约束可行：用整数规划做目标优化（预指派关系作为强制变量；单方案模式不会返回 null） ----
+  return (
+    optimize(hc.papers, hc.reviewers, hc.eligible, hc.organizations, hc.demands, hc.totalRequired, hc.forced) ??
+    greedyFallback(hc.papers, hc.reviewers, hc.eligible, hc.organizations, hc.demands, hc.totalRequired, hc.forced)
+  )
+}
+
+/**
+ * 在已通过硬约束评估的输入上，按给定多样性约束做字典序优化。
+ * 供“备选方案”模块复用：首方案传空约束（与 {@link solveAssignment} 完全一致），
+ * 后续方案对每个已生成方案传一条“对称差 ≥ N”约束。
+ * 返回 null 表示不存在满足全部多样性约束的可行方案。
+ */
+export function optimizeWithDiversity(hc: HardConstraintEvaluation, diversity: DiversityConstraint[]): AssignmentSuccess | null {
+  return optimize(
+    hc.papers,
+    hc.reviewers,
+    hc.eligible,
+    hc.organizations,
+    hc.demands,
+    hc.totalRequired,
+    hc.forced,
+    diversity
+  )
+}
+
+/** 方案的“稿件—评审人”关系集合（元素为 `i_j` 变量名，与多样性约束使用的键一致） */
+export function edgeSetOfSuccess(hc: HardConstraintEvaluation, result: AssignmentSuccess): Set<string> {
+  const paperIndex = new Map(hc.papers.map((p, i) => [p.id, i]))
+  const reviewerIndex = new Map(hc.reviewers.map((r, j) => [r.id, j]))
+  const edges = new Set<string>()
+  for (const a of result.assignments) {
+    const i = paperIndex.get(a.paperId)
+    const j = reviewerIndex.get(a.reviewerId)
+    if (i !== undefined && j !== undefined) edges.add(`${i}_${j}`)
+  }
+  return edges
 }
 
 /* ------------------------------ 整数规划优化 ------------------------------ */
+
+/**
+ * 备选方案多样性约束：针对某个已生成方案，当前解与其不同的“稿件—评审人”关系
+ * （分派边）至少 minDifference 条。
+ * 以对称差实现：令 priorEdges 为对照方案取 1 的变量名集合，
+ * 约束 Σ_{e∈priorEdges} (1−x_e) + Σ_{e∉priorEdges} x_e ≥ N
+ * （展开后即 |Prior\\Current| + |Current\\Prior| ≥ N，为对称差）。
+ * 预指派边在所有方案中恒为 1，不出现在约束中（它们对差异贡献恒为 0）。
+ */
+export interface DiversityConstraint {
+  priorEdges: Set<string>
+  minDifference: number
+}
 
 interface PhaseSolution {
   feasible: boolean
@@ -424,7 +472,8 @@ function runPhase(
   demands: number[],
   totalRequired: number,
   capLimit: number | null,
-  forced: ForcedMatrix
+  forced: ForcedMatrix,
+  diversity: DiversityConstraint[] = []
 ): PhaseSolution {
   const P = papers.length
   const R = reviewers.length
@@ -470,6 +519,33 @@ function runPhase(
     }
   }
 
+  // 备选方案多样性：每条对照方案一行“对称差 ≥ N”。
+  // 该行只包含自由边变量（预指派边恒为 1、差异恒为 0，无需入模）。
+  // 系数矩阵先在 diversityRows[k] 中按变量名组装，创建变量时再挂到模型上。
+  const diversityRows: Array<{ row: Record<string, number>; rhs: number }> = diversity.map((dc) => {
+    const row: Record<string, number> = {}
+    let inEdges = 0
+    for (let i = 0; i < P; i++) {
+      for (let j = 0; j < R; j++) {
+        if (!eligible[i][j]) continue
+        if (forced.forcedKeys.has(`${i}_${j}`)) continue
+        const varName = `x_${i}_${j}`
+        // priorEdges 的键为不含 `x_` 前缀的 `i_j`（与 edgeSetOfSuccess 输出一致）
+        if (dc.priorEdges.has(`${i}_${j}`)) {
+          row[varName] = -1 // 对照方案有、当前方案去掉：1 − x
+          inEdges++
+        } else {
+          row[varName] = 1 // 对照方案没有、当前方案新增：x
+        }
+      }
+    }
+    // 常数项 Σ_{e∈prior} 1 移到右端：min − 常数；左端最小可取 −inEdges，RHS 不得低于它
+    return { row, rhs: Math.max(-inEdges, dc.minDifference - inEdges) }
+  })
+  diversity.forEach((_, k) => {
+    model.constraints[`div_${k}`] = { min: diversityRows[k].rhs }
+  })
+
   for (let i = 0; i < P; i++) {
     for (let j = 0; j < R; j++) {
       if (!eligible[i][j]) continue // 冲突对不生成变量 —— 硬约束：利益冲突
@@ -486,6 +562,10 @@ function runPhase(
       }
       if (organizations[j]) {
         model.variables[varName][`org_${i}_${organizations[j]}`] = 1
+      }
+      for (let k = 0; k < diversityRows.length; k++) {
+        const c = diversityRows[k].row[varName]
+        if (c !== undefined) model.variables[varName][`div_${k}`] = c
       }
     }
   }
@@ -556,6 +636,14 @@ function buildSuccess(
   }
 }
 
+/**
+ * 字典序两阶段优化。
+ *
+ * diversity 为空（默认单方案模式）时：阶段一异常退回贪心可行解，行为与历史版本完全一致。
+ * diversity 非空（备选方案模式）时：在全部多样性约束下仍按“先匹配、后均衡”求最优；
+ * 若多样性约束已让模型不可行（不存在满足差异门槛的方案），返回 null，由上层据此停止生成
+ * （不退回贪心——贪心解无法保证差异门槛，返回它会破坏备选方案的核心承诺）。
+ */
 function optimize(
   papers: Paper[],
   reviewers: Reviewer[],
@@ -563,16 +651,18 @@ function optimize(
   organizations: string[],
   demands: number[],
   totalRequired: number,
-  forced: ForcedMatrix
-): AssignmentSuccess {
+  forced: ForcedMatrix,
+  diversity: DiversityConstraint[] = []
+): AssignmentSuccess | null {
   const R = reviewers.length
+  const isDiverse = diversity.length > 0
 
   // 阶段一：真实容量下最大化主题匹配数（预指派变量固定为 1），得到最优匹配数 M*
-  const phase1 = runPhase(papers, reviewers, eligible, organizations, demands, totalRequired, null, forced)
+  const phase1 = runPhase(papers, reviewers, eligible, organizations, demands, totalRequired, null, forced, diversity)
 
-  // 理论上最大流已保证可行；求解器异常时退回贪心可行解
+  // 理论上最大流已保证“无多样性约束时”可行；备选模式下不可行即不存在满足门槛的方案
   if (!phase1.feasible) {
-    return greedyFallback(papers, reviewers, eligible, organizations, demands, totalRequired, forced)
+    return isDiverse ? null : greedyFallback(papers, reviewers, eligible, organizations, demands, totalRequired, forced)
   }
   const bestMatches = phase1.matches
   let bestRaw = phase1.raw
@@ -588,7 +678,7 @@ function optimize(
 
   while (lo < hi) {
     const mid = (lo + hi) >> 1
-    const r = runPhase(papers, reviewers, eligible, organizations, demands, totalRequired, mid, forced)
+    const r = runPhase(papers, reviewers, eligible, organizations, demands, totalRequired, mid, forced, diversity)
     if (r.feasible && r.matches === bestMatches) {
       hi = mid
       bestRaw = r.raw
@@ -599,18 +689,18 @@ function optimize(
 
   const assignments = parseSolution(papers, reviewers, eligible, bestRaw, forced)
   if (assignments.length !== totalRequired) {
-    return greedyFallback(papers, reviewers, eligible, organizations, demands, totalRequired, forced)
+    return isDiverse ? null : greedyFallback(papers, reviewers, eligible, organizations, demands, totalRequired, forced)
   }
   // 防御性校验：求解结果必须完整包含全部预指派
   for (const key of forced.forcedKeys) {
     const [i, j] = key.split('_').map(Number)
     if (!assignments.some((a) => a.paperId === papers[i].id && a.reviewerId === reviewers[j].id)) {
-      return greedyFallback(papers, reviewers, eligible, organizations, demands, totalRequired, forced)
+      return isDiverse ? null : greedyFallback(papers, reviewers, eligible, organizations, demands, totalRequired, forced)
     }
   }
   // 防御性校验：同一篇稿件不得出现同一机构两人（机构去重硬约束，空机构除外）
   if (hasDuplicateOrganization(papers, reviewers, assignments)) {
-    return greedyFallback(papers, reviewers, eligible, organizations, demands, totalRequired, forced)
+    return isDiverse ? null : greedyFallback(papers, reviewers, eligible, organizations, demands, totalRequired, forced)
   }
   return buildSuccess(reviewers, assignments, totalRequired)
 }

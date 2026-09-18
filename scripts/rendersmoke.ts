@@ -13,6 +13,7 @@ import { renderToString } from 'react-dom/server'
 import App from '../src/App'
 import { createSampleData } from '../src/sampleData'
 import { solveAssignment, computeMatchedTags } from '../src/engine/solver'
+import { singlePlanSet, solveAlternatives, validateAlternativesRequest } from '../src/engine/alternatives'
 import { ResultPanel } from '../src/components/ResultPanel'
 import { PapersPanel } from '../src/components/PapersPanel'
 import { ReviewersPanel } from '../src/components/ReviewersPanel'
@@ -24,7 +25,22 @@ const html1 = renderToString(React.createElement(App))
 if (!html1.includes('盲审分配台')) throw new Error('未渲染标题')
 if (!html1.includes('生成分派')) throw new Error('未渲染生成按钮')
 if (!html1.includes('还没有稿件')) throw new Error('空态提示异常')
+if (!html1.includes('备选方案')) throw new Error('备选方案选项未渲染')
 console.log('✓ 空数据渲染成功，长度', html1.length)
+
+// 成功结果页统一以“方案集”传入（单方案包装），以下为复用的小工具
+const panelProps = (data: AppData, solved: ReturnType<typeof solveAssignment>, stale = false) =>
+  solved.feasible
+    ? {
+        data,
+        planSet: singlePlanSet(solved),
+        selectedPlan: 0,
+        onSelectPlan: () => {},
+        stale,
+        onExport: () => {},
+        onApplySwap: () => {}
+      }
+    : { data, planSet: solved, selectedPlan: 0, onSelectPlan: () => {}, stale, onExport: () => {}, onApplySwap: () => {} }
 
 // 写入示例数据后渲染（localStorage 初始值，落在"稿件"标签页）
 store.set('blind-review-desk:data:v1', JSON.stringify(createSampleData()))
@@ -40,37 +56,26 @@ console.log('✓ 示例数据渲染成功，长度', html2.length)
   const data = createSampleData()
   const solved = solveAssignment(data)
   if (!solved.feasible) throw new Error('示例数据应可生成可行方案')
-  const html3 = renderToString(
-    React.createElement(ResultPanel, {
-      data,
-      result: solved,
-      stale: false,
-      onExport: () => {},
-      onApplySwap: () => {}
-    })
-  )
+  const html3 = renderToString(React.createElement(ResultPanel, panelProps(data, solved)))
   if (!html3.includes('分派互换')) throw new Error('分派互换工具未渲染')
   if (!html3.includes('请选择')) throw new Error('评审人选择器未渲染')
   if (!html3.includes('导出结果 JSON')) throw new Error('导出按钮未渲染')
   console.log('✓ 成功结果页（含分派互换）渲染成功，长度', html3.length)
 
   // 过期结果页：互换工具应暂停并提示
-  const html4 = renderToString(
-    React.createElement(ResultPanel, { data, result: solved, stale: true, onExport: () => {}, onApplySwap: () => {} })
-  )
+  const html4 = renderToString(React.createElement(ResultPanel, panelProps(data, solved, true)))
   if (html4.includes('分派互换（一换一）')) throw new Error('过期结果不应展示互换工具')
   if (!html4.includes('可能已过期')) throw new Error('过期提示未渲染')
   console.log('✓ 过期结果页暂停互换渲染成功')
 
   // 人工调整后：徽章与导出 JSON 需反映标记
   const adjusted = { ...solved, manuallyAdjusted: true as const, swapCount: 1 }
-  const html5 = renderToString(
-    React.createElement(ResultPanel, { data, result: adjusted, stale: false, onExport: () => {}, onApplySwap: () => {} })
-  )
+  const html5 = renderToString(React.createElement(ResultPanel, panelProps(data, adjusted)))
   if (!html5.includes('已人工调整')) throw new Error('已人工调整徽章未渲染')
   const payload = buildExportPayload(data, adjusted)
   if (payload.manuallyAdjusted !== true || payload.swapCount !== 1) throw new Error('导出未反映人工调整标记')
   if (payload.assignments.length !== solved.assignments.length) throw new Error('导出分派条数异常')
+  if (payload.plan.planIndex !== 1 || payload.plan.requestedCount !== 1) throw new Error('单方案导出缺少方案序号（应为 1/1）')
   console.log('✓ 已人工调整徽章与导出标记正确')
 
   // 匹配标签计算在面板外可复用（互换重算口径）
@@ -111,7 +116,7 @@ console.log('✓ 示例数据渲染成功，长度', html2.length)
   const fail = solveAssignment(data)
   if (fail.feasible) throw new Error('含失效预指派时不应生成结果')
   const failHtml = renderToString(
-    React.createElement(ResultPanel, { data, result: fail, stale: false, onExport: () => {}, onApplySwap: () => {} })
+    React.createElement(ResultPanel, panelProps(data, fail))
   )
   if (!failHtml.includes('预指派硬约束无法满足')) throw new Error('预指派失败横幅未渲染')
   if (!failHtml.includes('rev_deleted')) throw new Error('失败结果未列出失效评审人')
@@ -125,7 +130,7 @@ console.log('✓ 示例数据渲染成功，长度', html2.length)
   if (!ok.assignments.some((a) => a.paperId === base.papers[0].id && a.reviewerId === 'rev_bob' && a.preassigned))
     throw new Error('Bob 对第一篇的预指派未体现在结果中')
   const okHtml = renderToString(
-    React.createElement(ResultPanel, { data: okData, result: ok, stale: false, onExport: () => {}, onApplySwap: () => {} })
+    React.createElement(ResultPanel, panelProps(okData, ok))
   )
   if (!okHtml.includes('预指派')) throw new Error('成功结果未展示预指派标记')
   const payload = buildExportPayload(okData, ok)
@@ -171,12 +176,88 @@ console.log('✓ 示例数据渲染成功，长度', html2.length)
   const dupFail = solveAssignment(dup)
   if (dupFail.feasible) throw new Error('同稿预指派同机构应整体拒绝')
   const dupHtml = renderToString(
-    React.createElement(ResultPanel, { data: dup, result: dupFail, stale: false, onExport: () => {}, onApplySwap: () => {} })
+    React.createElement(ResultPanel, panelProps(dup, dupFail))
   )
   if (!dupHtml.includes('清华大学')) throw new Error('机构重复失败结果未列出机构')
   if (!dupHtml.includes('预指派机构重复')) throw new Error('未渲染机构重复原因标签')
   if (dupHtml.includes('assignee')) throw new Error('机构重复失败不应含分派结果')
   console.log('✓ 预指派同稿机构重复整体拒绝（列出机构与评审人）渲染成功')
+}
+
+// 备选方案：构造余量充足的数据，请求 3 个方案并验证标签切换/差异对比/导出
+{
+  const data: AppData = {
+    papers: [
+      { id: 'p1', title: '稿件一', reviewsRequired: 1, tags: ['T'] },
+      { id: 'p2', title: '稿件二', reviewsRequired: 1, tags: ['T'] }
+    ],
+    reviewers: [
+      { id: 'a', name: '甲', organization: '', tags: ['T'], capacity: 2, conflictPaperIds: [] },
+      { id: 'b', name: '乙', organization: '', tags: ['T'], capacity: 2, conflictPaperIds: [] },
+      { id: 'c', name: '丙', organization: '', tags: [], capacity: 2, conflictPaperIds: [] }
+    ],
+    preAssignments: []
+  }
+  const set = solveAlternatives(data, validateAlternativesRequest(3, 2))
+  if (!set.feasible) throw new Error('余量充足数据应可生成备选方案')
+  if (set.plans.length !== 3) throw new Error(`应凑满 3 个方案，实际 ${set.plans.length}（${set.stopReason ?? ''}）`)
+  for (let i = 1; i < set.plans.length; i++) {
+    const vs = set.plans[i].differences.find((d) => d.otherPlanIndex === 0)
+    if (!vs || vs.symmetricDifference < 2) throw new Error(`方案 ${i + 1} 与首方案差异不足 N=2`)
+  }
+  const html = renderToString(
+    React.createElement(ResultPanel, {
+      data,
+      planSet: set,
+      selectedPlan: 1,
+      onSelectPlan: () => {},
+      stale: false,
+      onExport: () => {},
+      onApplySwap: () => {}
+    })
+  )
+  if (
+    !html.includes('data-plan-index="0"') ||
+    !html.includes('data-plan-index="1"') ||
+    !html.includes('data-plan-index="2"')
+  )
+    throw new Error('方案标签未全部渲染')
+  if (!html.includes('与首方案差')) throw new Error('标签上未展示相对首方案差异条数')
+  if (!html.includes('备选方案 2')) throw new Error('未渲染选中方案标题')
+  if (!html.includes('导出当前方案 JSON（方案 2/3）')) throw new Error('导出按钮未标明当前方案序号')
+  console.log('✓ 备选方案（3 个标签 / 差异对比 / 选中序号）渲染成功')
+
+  // 导出当前选中方案：写入方案序号与差异统计
+  const payload = buildExportPayload(data, set.plans[1], {
+    planIndex: set.plans[1].planIndex,
+    requestedCount: set.requestedCount,
+    minDifference: set.minDifference,
+    differences: set.plans[1].differences
+  })
+  if (payload.plan.planIndex !== 2 || payload.plan.requestedCount !== 3 || payload.plan.minDifference !== 2)
+    throw new Error('导出未写入方案序号/数量/差异门槛')
+  const vsPlan1 = payload.plan.differences.find((d) => d.otherPlanIndex === 1)
+  if (!vsPlan1 || vsPlan1.symmetricDifference < 2) throw new Error('导出缺少相对首方案的差异统计')
+  console.log('✓ 备选方案导出含方案序号与差异统计')
+
+  // N 超过上限：保留首方案并说明停止原因
+  const tooBig = solveAlternatives(data, validateAlternativesRequest(2, 99))
+  if (!tooBig.feasible || tooBig.plans.length !== 1 || !tooBig.stopReason)
+    throw new Error('N 超上限时应保留首方案并给出停止原因')
+  const stopHtml = renderToString(
+    React.createElement(ResultPanel, {
+      data,
+      planSet: tooBig,
+      selectedPlan: 0,
+      onSelectPlan: () => {},
+      stale: false,
+      onExport: () => {},
+      onApplySwap: () => {}
+    })
+  )
+  if (!stopHtml.includes('plan-stop-banner') || !stopHtml.includes('超过可达到的上限'))
+    throw new Error('停止原因横幅未渲染')
+  console.log('✓ N 超上限时保留已找到方案并说明停止原因')
 }
 
 // 旧数据兼容：localStorage 中没有 preAssignments 字段时，应用仍可正常渲染与求解

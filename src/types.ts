@@ -128,6 +128,48 @@ export interface AssignmentFailure {
 
 export type AssignmentResult = AssignmentSuccess | AssignmentFailure
 
+/* ------------------------- 备选方案（多方案生成） ------------------------- */
+
+/**
+ * 两个方案之间的差异统计：以“稿件—评审人”关系（分派边）集合的对称差计。
+ * 每替换 1 条分派（移除一条旧关系、加入一条新关系）记 2 条不同关系；
+ * 预指派关系是硬约束，在所有方案中都相同，差异只能来自自由名额。
+ */
+export interface PlanDifference {
+  /** 对照方案的序号（从 0 开始；0 即首方案/字典序最优方案） */
+  otherPlanIndex: number
+  /** 两方案不同的稿件—评审人关系条数（对称差：|A\\B| + |B\\A|，恒为偶数） */
+  symmetricDifference: number
+  /** 两方案相同（共用）的稿件—评审人关系条数 */
+  common: number
+}
+
+/** 单个备选方案：在成功结果上附带方案序号与对其他方案的差异统计 */
+export interface AssignmentPlan extends AssignmentSuccess {
+  /** 方案序号（从 0 开始；0 为按现有字典序目标求出的最优方案） */
+  planIndex: number
+  /** 与其余每个已生成方案的差异统计（不含自身；首方案也列出对备选方案的差异） */
+  differences: PlanDifference[]
+}
+
+/**
+ * 一次（可能为多方案的）生成分派的成功结果。
+ * 单方案模式（方案数量=1，默认行为）下 plans 长度为 1、minDifference=0。
+ */
+export interface PlanSetSuccess {
+  feasible: true
+  /** 用户请求生成的方案数量（1～3） */
+  requestedCount: number
+  /** 用户输入的最小差异 N（方案数量为 1 时为 0） */
+  minDifference: number
+  /** 实际找到的方案（1～requestedCount 个）；无法凑满时少于 requestedCount，并在 stopReason 说明 */
+  plans: AssignmentPlan[]
+  /** 未能凑满请求数量时的停止原因（人类可读；凑满或缺省为 undefined） */
+  stopReason?: string
+}
+
+export type PlanSetResult = PlanSetSuccess | AssignmentFailure
+
 /* ------------------------- 评审人缺席压力测试 ------------------------- */
 
 /** 缺席场景中的“可选评审人瓶颈”见证条目 */
