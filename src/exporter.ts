@@ -1,11 +1,25 @@
 import type { AppData, AssignmentSuccess, StressTestReport } from './types'
 
+/** 导出时附加的方案序号与差异统计（备选方案模式；单方案导出时为第 1 个方案） */
+export interface ExportSolutionMeta {
+  /** 当前选中方案的序号（1 起） */
+  index: number
+  /** 本次生成的方案总数 */
+  total: number
+  /** 用户输入的最小差异条数 N（单方案模式缺省为 0） */
+  minDifference: number
+  /** 与第 1 个（字典序最优）方案不同的稿件—评审人关系条数（对称差）；首方案为 0 */
+  diffToFirst: number
+}
+
 export interface ExportPayload {
   exportedAt: string
   /** 结果是否经过「分派互换」人工调整（未调整时缺省为 false） */
   manuallyAdjusted: boolean
   /** 累计执行的一换一互换次数 */
   swapCount: number
+  /** 导出方案的序号与差异统计 */
+  solution: ExportSolutionMeta
   summary: AssignmentSuccess['objective']
   assignments: Array<{
     paperId: string
@@ -30,13 +44,18 @@ export interface ExportPayload {
   }>
 }
 
-export function buildExportPayload(data: AppData, result: AssignmentSuccess): ExportPayload {
+export function buildExportPayload(
+  data: AppData,
+  result: AssignmentSuccess,
+  meta: ExportSolutionMeta = { index: 1, total: 1, minDifference: 0, diffToFirst: 0 }
+): ExportPayload {
   const paperMap = new Map(data.papers.map((p) => [p.id, p]))
   const reviewerMap = new Map(data.reviewers.map((r) => [r.id, r]))
   return {
     exportedAt: new Date().toISOString(),
     manuallyAdjusted: result.manuallyAdjusted === true,
     swapCount: result.swapCount ?? 0,
+    solution: meta,
     summary: result.objective,
     assignments: result.assignments.map((a) => ({
       paperId: a.paperId,

@@ -126,7 +126,32 @@ export interface AssignmentFailure {
   reasons: InfeasibleReason[]
 }
 
-export type AssignmentResult = AssignmentSuccess | AssignmentFailure
+/**
+ * 备选方案批量结果（用户选择生成 2～3 个方案时）。
+ * 首个方案与单方案模式完全一致（字典序最优）；后续方案满足全部硬约束，
+ * 且与已生成的每个方案至少相差 minDifference 条稿件—评审人关系（对称差异）。
+ * 无法凑满 requestedCount 时，保留已找到方案并在 stopReason 说明停止原因。
+ */
+export interface AssignmentBatchSuccess {
+  feasible: true
+  /** 判别标记：普通 AssignmentSuccess 不带 kind */
+  kind: 'batch'
+  /** 用户请求的方案数（1～3） */
+  requestedCount: number
+  /** 用户输入并通过校验的最小差异条数 N */
+  minDifference: number
+  /** 未能凑满数量时的停止原因说明；凑满时缺省 */
+  stopReason?: string
+  /** 已找到的方案（至少 1 个；第 1 个为字典序最优方案） */
+  solutions: AssignmentSuccess[]
+}
+
+export type AssignmentResult = AssignmentSuccess | AssignmentBatchSuccess | AssignmentFailure
+
+/** 类型守卫：是否为备选方案批量结果 */
+export function isBatchResult(result: AssignmentResult): result is AssignmentBatchSuccess {
+  return result.feasible && (result as AssignmentBatchSuccess).kind === 'batch'
+}
 
 /* ------------------------- 评审人缺席压力测试 ------------------------- */
 

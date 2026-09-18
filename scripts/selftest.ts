@@ -1,6 +1,7 @@
-import { solveAssignment, computeMatchedTags } from '../src/engine/solver'
+import { solveAssignment, solveAssignmentBatch, computeMatchedTags } from '../src/engine/solver'
 import { runStressTest, stressFingerprint } from '../src/engine/stress'
 import { enumerateSwaps, applySwapCandidate, type SwapCandidate } from '../src/engine/swap'
+import { symmetricDifference, validateBatchOptions } from '../src/engine/alternatives'
 import type { AppData, AssignmentSuccess } from '../src/types'
 
 let pass = 0
@@ -920,6 +921,195 @@ const PA = (id: string, paperId: string, reviewerId: string) => ({ id, paperId, 
     const a = out.report.scenarios.find((s) => s.reviewerId === 'a')
     check('甲缺席场景存在且不可行', !!a && !a.feasible, JSON.stringify(a?.feasible))
   }
+}
+
+/* ============================ 备选方案（1～3 个方案 + 差异 N） ============================ */
+
+// 40. count=1 退化为单方案：返回普通 AssignmentSuccess（无 kind），与 solveAssignment 一致
+{
+  const d = mk(
+    [P('p1', 'ML', 1, ['ML']), P('p2', 'SYS', 1, ['SYS'])],
+    [R('a', 'Alice', 2, ['ML']), R('b', 'Bob', 2, ['SYS']), R('c', 'Carol', 2)]
+  )
+  const single = solveAssignment(d)
+  const batch1 = solveAssignmentBatch(d, 1, 0)
+  console.log('用例40 备选模式 count=1 退化为单方案')
+  check('count=1 返回普通成功结果（无 batch 标记）', batch1.feasible && (batch1 as { kind?: string }).kind === undefined)
+  check('与 solveAssignment 分派完全一致', JSON.stringify(batch1) === JSON.stringify(single))
+}
+
+// 41. 生成 3 个方案：全部可行、满足全部硬约束，两两差异 ≥ N
+{
+  // 4 篇各需 2，6 位容量充足、无冲突，提供多种可行组合
+  const d = mk(
+    [P('p1', 'A', 2), P('p2', 'B', 2), P('p3', 'C', 2), P('p4', 'D', 2)],
+    [R('a', '甲', 4), R('b', '乙', 4), R('c', '丙', 4), R('dd', '丁', 4), R('e', '戊', 4), R('f', '己', 4)]
+  )
+  const N = 2
+  const out = solveAssignmentBatch(d, 3, N)
+  console.log('用例41 生成3个备选方案')
+  check('返回批量结果且含 3 个方案', out.feasible && (out as { kind?: string }).kind === 'batch' && (out as any).solutions?.length === 3, JSON.stringify((out as any).solutions?.length))
+  if (out.feasible && (out as { kind?: string }).kind === 'batch') {
+    const sols = (out as any).solutions as AssignmentSuccess[]
+    check('无停止原因（凑满数量）', !(out as any).stopReason)
+    check('记录 requestedCount=3 与 N=2', (out as any).requestedCount === 3 && (out as any).minDifference === 2)
+    // 第 1 个方案与单方案字典序最优完全一致
+    check('方案1 即字典序最优方案', JSON.stringify(sols[0]) === JSON.stringify(solveAssignment(d)))
+    // 每个方案都满足全部硬约束
+    let allValid = true
+    for (const s of sols) {
+      if (s.objective.totalAssigned !== 8) allValid = false
+      if (s.loads.some((l) => l.assigned > l.capacity)) allValid = false
+      const perPaper = new Map<string, number>()
+      for (const it of s.assignments) perPaper.set(it.paperId, (perPaper.get(it.paperId) ?? 0) + 1)
+      for (const p of d.papers) if (perPaper.get(p.id) !== 2) allValid = false
+    }
+    check('每个方案均满足全部硬约束（名额/容量/人数）', allValid)
+    // 两两对称差 ≥ N
+    let pairwise = true
+    const diffs: number[] = []
+    for (let i = 0; i < sols.length; i++)
+      for (let j = i + 1; j < sols.length; j++) {
+        const df = symmetricDifference(sols[i], sols[j])
+        diffs.push(df)
+        if (df < N) pairwise = false
+      }
+    check('任意两方案关系对称差 ≥ N=2', pairwise, JSON.stringify(diffs))
+    check('每个方案与方案1都不同（diffToFirst > 0）', sols.slice(1).every((s) => symmetricDifference(sols[0], s) >= N))
+  }
+}
+
+// 42. 差异条数为对称差：所有方案关系条数相同（恒为偶数差异）
+{
+  const d = mk(
+    [P('p1', 'A', 1), P('p2', 'B', 1)],
+    [R('a', '甲', 2), R('b', '乙', 2), R('c', '丙', 2)]
+  )
+  const out = solveAssignmentBatch(d, 2, 2)
+  console.log('用例42 对称差恒为偶数')
+  if (out.feasible && (out as { kind?: string }).kind === 'batch') {
+    const sols = (out as any).solutions as AssignmentSuccess[]
+    const df = symmetricDifference(sols[0], sols[1])
+    check('两方案差异为偶数 2（互换一位评审人）', df === 2, `got ${df}`)
+  } else {
+    check('批量求解成功', false)
+  }
+}
+
+// 43. 无法凑满数量：保留已找到方案并给出停止原因
+{
+  // 单篇稿件只需 1 人，恰有 2 位无冲突评审人：可行方案只有“选甲”“选乙”两种，
+  // 两两对称差=2；请求 3 个、N=2 时找到 2 个后第 3 次 ILP 在切割下不可行。
+  const d = mk([P('p1', 'A', 1)], [R('a', '甲', 2), R('b', '乙', 2)])
+  const out = solveAssignmentBatch(d, 3, 2)
+  console.log('用例43 无法凑满时保留并说明原因')
+  check('批量结果仍成功（保留已找到方案）', out.feasible && (out as { kind?: string }).kind === 'batch')
+  if (out.feasible && (out as { kind?: string }).kind === 'batch') {
+    check('只找到 2 个方案（可行结构仅有两种）', (out as any).solutions.length === 2, `got ${(out as any).solutions.length}`)
+    check('给出停止原因', typeof (out as any).stopReason === 'string' && (out as any).stopReason.includes('停止'), String((out as any).stopReason))
+    check('requestedCount 仍记录为 3', (out as any).requestedCount === 3)
+    check('保留的 2 个方案本身差异=2', symmetricDifference((out as any).solutions[0], (out as any).solutions[1]) === 2)
+  }
+}
+
+// 44. N 超过可实现上界时（引擎层）校验失败
+{
+  const d = mk([P('p1', 'A', 2)], [R('a', '甲', 2, [], ['p0']), R('b', '乙', 2), R('c', '丙', 2)])
+  const first = solveAssignment(d) as AssignmentSuccess
+  console.log('用例44 N 校验')
+  const v1 = validateBatchOptions({ requestedCount: 2, minDifferenceInput: 5, reference: first })
+  check('N=5 超过上界 4 → 拒绝', !v1.ok)
+  const v2 = validateBatchOptions({ requestedCount: 2, minDifferenceInput: 4, reference: first })
+  check('N=4 等于上界 → 通过', v2.ok && v2.minDifference === 4)
+  const v3 = validateBatchOptions({ requestedCount: 2, minDifferenceInput: 0, reference: first })
+  check('N=0 拒绝', !v3.ok)
+  const v4 = validateBatchOptions({ requestedCount: 1, minDifferenceInput: 0, reference: first })
+  check('count=1 不需要 N', v4.ok)
+  // 批量入口对越界 N 返回失败结果（不抛异常）
+  const bad = solveAssignmentBatch(d, 2, 99)
+  check('批量入口对越界 N 返回失败', !bad.feasible)
+}
+
+// 45. 预指派压缩可实现差异：上界只计自由关系
+{
+  // p1 需 2，其中 b 被预指派（所有方案相同）；p2 需 1。总名额 3，自由 2 → 上界 4
+  const d = mk(
+    [P('p1', 'A', 2), P('p2', 'B', 1)],
+    [R('a', '甲', 3), R('b', '乙', 3), R('c', '丙', 3)],
+    [PA('pa1', 'p1', 'b')]
+  )
+  const first = solveAssignment(d) as AssignmentSuccess
+  console.log('用例45 预指派压缩差异上界')
+  check('上界 = 2×(3−1)=4', validateBatchOptions({ requestedCount: 3, minDifferenceInput: 4, reference: first }).ok)
+  check('N=6 超过（预指派不可变）→ 拒绝', !validateBatchOptions({ requestedCount: 3, minDifferenceInput: 6, reference: first }).ok)
+  const out = solveAssignmentBatch(d, 2, 4)
+  if (out.feasible && (out as { kind?: string }).kind === 'batch') {
+    const sols = (out as any).solutions as AssignmentSuccess[]
+    check('两方案都保留预指派 b→p1', sols.every((s) => s.assignments.some((x) => x.paperId === 'p1' && x.reviewerId === 'b' && x.preassigned)))
+    check('自由关系完全错开（对称差=4）', sols.length === 2 && symmetricDifference(sols[0], sols[1]) === 4, `got ${sols.length === 2 ? symmetricDifference(sols[0], sols[1]) : '-'}`)
+  } else {
+    check('N=4 批量求解成功', false)
+  }
+}
+
+// 46. 备选方案导出：写入方案序号与差异统计
+{
+  const { buildExportPayload } = await import('../src/exporter')
+  const d = mk(
+    [P('p1', 'A', 1), P('p2', 'B', 1), P('p3', 'C', 1)],
+    [R('a', '甲', 3), R('b', '乙', 3), R('c', '丙', 3), R('dd', '丁', 3)]
+  )
+  const out = solveAssignmentBatch(d, 2, 2)
+  console.log('用例46 备选导出序号与差异')
+  if (out.feasible && (out as { kind?: string }).kind === 'batch') {
+    const sols = (out as any).solutions as AssignmentSuccess[]
+    const df = symmetricDifference(sols[0], sols[1])
+    const p0 = buildExportPayload(d, sols[0], { index: 1, total: 2, minDifference: 2, diffToFirst: 0 })
+    const p1 = buildExportPayload(d, sols[1], { index: 2, total: 2, minDifference: 2, diffToFirst: df })
+    check('方案1导出 solution.index=1、diffToFirst=0', p0.solution.index === 1 && p0.solution.diffToFirst === 0 && p0.solution.total === 2 && p0.solution.minDifference === 2)
+    check('方案2导出 solution.index=2、diffToFirst=实际对称差', p1.solution.index === 2 && p1.solution.diffToFirst === df && df >= 2, JSON.stringify(p1.solution))
+    // 单方案默认导出仍带默认 meta（超集兼容）
+    const single = buildExportPayload(d, sols[0])
+    check('单方案导出默认 meta 为 1/1/0/0', single.solution.index === 1 && single.solution.total === 1 && single.solution.minDifference === 0 && single.solution.diffToFirst === 0)
+  } else {
+    check('批量求解成功', false)
+  }
+}
+
+// 47. 备选模式互换：守卫排除会让差异跌破 N 的候选
+{
+  // 构造两个已知方案，方案2 与方案1 恰好相差 2（处于 N=2 临界）；
+  // 在方案2 上做某些互换会把它变回方案1（差异 0），必须被守卫排除。
+  const d = mk(
+    [P('p1', 'ML', 1, ['ML']), P('p2', 'SYS', 1, ['SYS'])],
+    [R('a', 'Alice', 2, ['ML']), R('b', 'Bob', 2, ['SYS']), R('c', 'Carol', 2, [])]
+  )
+  // 方案1（最优匹配）：a→p1, b→p2；方案2：a→p2, c→p1（差异 4）
+  const s1 = makeSuccess(d, [
+    ['p1', 'a'],
+    ['p2', 'b']
+  ])
+  const s2 = makeSuccess(d, [
+    ['p1', 'c'],
+    ['p2', 'a']
+  ])
+  console.log('用例47 备选互换多样性守卫')
+  check('构造的两方案差异=4', symmetricDifference(s1, s2) === 4, `got ${symmetricDifference(s1, s2)}`)
+  const edges1 = new Set(s1.assignments.map((x) => `${x.paperId}␟${x.reviewerId}`))
+  // 在 s2 上枚举 a×c：互换 a(p2)×c(p1) → a→p1, c→p2，与 s1 差异变为 2（仍 ≥ N=2，放行）
+  const guard2: { minDifference: number; otherEdgeSets: Set<string>[] } = { minDifference: 2, otherEdgeSets: [edges1] }
+  const en2 = enumerateSwaps(d, s2, 'a', 'c', guard2)
+  check('守卫 N=2：互换后差异=2 的候选放行', en2.candidates.length === 1, `got ${en2.candidates.length}`)
+  // N=4：互换后与 s1 差异变 2 < 4 → 必须排除
+  const guard4 = { minDifference: 4, otherEdgeSets: [edges1] }
+  const en4 = enumerateSwaps(d, s2, 'a', 'c', guard4)
+  check('守卫 N=4：差异跌破的候选被排除（diversity 计数）', en4.candidates.length === 0 && en4.excluded.diversity === 1, JSON.stringify(en4.excluded))
+  // 应用阶段同样拒绝
+  const cand = en2.candidates[0]
+  check('applySwapCandidate 在 N=4 守卫下返回 null', cand ? applySwapCandidate(d, s2, cand, guard4) === null : false)
+  // 无守卫时行为与原来一致（向后兼容）
+  const enNoGuard = enumerateSwaps(d, s2, 'a', 'c')
+  check('无守卫时 diversity 计数为 0、候选正常', enNoGuard.candidates.length === 1 && enNoGuard.excluded.diversity === 0)
 }
 
 console.log(`\n结果: ${pass} 通过, ${fail} 失败`)

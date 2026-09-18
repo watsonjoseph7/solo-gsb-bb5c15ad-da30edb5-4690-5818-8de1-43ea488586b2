@@ -21,7 +21,18 @@
  * 确认时仅在结果层改派，不触碰录入数据（AppData）。
  */
 import { computeMatchedTags } from './solver'
+import { symmetricDifferenceOfEdges } from './alternatives'
 import type { AppData, AssignmentItem, AssignmentSuccess, Paper, Reviewer } from '../types'
+
+/**
+ * 备选方案多样性守卫（仅在一次生成多个方案时有值）：
+ * 人工互换后当前方案与每个“其余方案”的关系对称差仍必须 ≥ minDifference。
+ * otherEdgeSets 为其余方案当前的关系集合（全局 "paperId␟reviewerId" 键）。
+ */
+export interface DiversityGuard {
+  minDifference: number
+  otherEdgeSets: Set<string>[]
+}
 
 /** 单条一换一候选的交换单侧描述（谁把自己的哪篇换成对方的哪篇） */
 export interface SwapSide {
@@ -62,11 +73,33 @@ export interface SwapExclusionCounts {
   preassigned: number
   /** 交换后会让同一稿件出现同一机构的两位评审人（机构去重硬约束） */
   organization: number
+  /** 交换后当前方案与某备选方案的差异条数会低于 N（备选模式多样性约束） */
+  diversity: number
 }
 
 export interface SwapEnumeration {
   candidates: SwapCandidate[]
   excluded: SwapExclusionCounts
+}
+
+/** 当前方案应用一次互换后的关系集合（用于备选模式差异复核） */
+function edgesAfterSwap(assignments: AssignmentItem[], candidate: SwapCandidate): Set<string> {
+  const edges = new Set<string>()
+  for (const a of assignments) {
+    const movingA = a.paperId === candidate.sideA.fromPaperId && a.reviewerId === candidate.sideA.reviewerId
+    const movingB = a.paperId === candidate.sideB.fromPaperId && a.reviewerId === candidate.sideB.reviewerId
+    if (!movingA && !movingB) edges.add(`${a.paperId}␟${a.reviewerId}`)
+  }
+  edges.add(`${candidate.sideA.toPaperId}␟${candidate.sideA.reviewerId}`)
+  edges.add(`${candidate.sideB.toPaperId}␟${candidate.sideB.reviewerId}`)
+  return edges
+}
+
+/** 备选模式：交换后不得让当前方案与任何其余方案的差异条数低于 N */
+function violatesDiversity(candidate: SwapCandidate, current: AssignmentSuccess, guard: DiversityGuard | undefined): boolean {
+  if (!guard || guard.otherEdgeSets.length === 0) return false
+  const nextEdges = edgesAfterSwap(current.assignments, candidate)
+  return guard.otherEdgeSets.some((other) => symmetricDifferenceOfEdges(nextEdges, other) < guard.minDifference)
 }
 
 function matchInfo(paper: Paper | undefined, reviewer: Reviewer | undefined): { tags: string[]; matched: boolean } {
@@ -112,8 +145,14 @@ function orgConflictOnPaper(
  * 枚举两位评审人之间所有可行的一换一候选。
  * 要求两位评审人当前都至少承担一篇稿件，否则返回空列表。
  */
-export function enumerateSwaps(data: AppData, result: AssignmentSuccess, reviewerAId: string, reviewerBId: string): SwapEnumeration {
-  const excluded: SwapExclusionCounts = { samePaper: 0, conflict: 0, duplicate: 0, preassigned: 0, organization: 0 }
+export function enumerateSwaps(
+  data: AppData,
+  result: AssignmentSuccess,
+  reviewerAId: string,
+  reviewerBId: string,
+  guard?: DiversityGuard
+): SwapEnumeration {
+  const excluded: SwapExclusionCounts = { samePaper: 0, conflict: 0, duplicate: 0, preassigned: 0, organization: 0, diversity: 0 }
   if (!reviewerAId || !reviewerBId || reviewerAId === reviewerBId) {
     return { candidates: [], excluded }
   }
@@ -211,7 +250,15 @@ export function enumerateSwaps(data: AppData, result: AssignmentSuccess, reviewe
       const deltaMatches =
         Number(afterA.matched) + Number(afterB.matched) - Number(beforeA.matched) - Number(beforeB.matched)
 
-      candidates.push({ reviewerAId, reviewerBId, sideA, sideB, deltaMatches })
+      const tentative: SwapCandidate = { reviewerAId, reviewerBId, sideA, sideB, deltaMatches }
+
+      // 排除项 5（备选模式）：互换后当前方案与任一其余方案的差异条数会跌破 N
+      if (violatesDiversity(tentative, result, guard)) {
+        excluded.diversity++
+        continue
+      }
+
+      candidates.push(tentative)
     }
   }
 
@@ -249,7 +296,8 @@ function rebuildLoads(
 export function applySwapCandidate(
   data: AppData,
   result: AssignmentSuccess,
-  candidate: SwapCandidate
+  candidate: SwapCandidate,
+  guard?: DiversityGuard
 ): AssignmentSuccess | null {
   const { sideA, sideB } = candidate
   const reviewerMap = new Map(data.reviewers.map((r) => [r.id, r]))
@@ -327,6 +375,12 @@ export function applySwapCandidate(
     if (set.has(org)) return null
     set.add(org)
     orgsByPaper.set(a.paperId, set)
+  }
+
+  // 备选模式兜底复核：应用互换后的关系集合与每个其余方案的差异条数仍须 ≥ N
+  if (guard && guard.otherEdgeSets.length > 0) {
+    const nextEdges = edgesAfterSwap(next, candidate)
+    if (guard.otherEdgeSets.some((other) => symmetricDifferenceOfEdges(nextEdges, other) < guard.minDifference)) return null
   }
 
   const topicMatches = next.filter((a) => a.topicMatched).length

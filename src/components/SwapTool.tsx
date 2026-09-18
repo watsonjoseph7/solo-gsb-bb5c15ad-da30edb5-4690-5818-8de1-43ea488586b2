@@ -1,18 +1,20 @@
 import { useEffect, useMemo, useState } from 'react'
 import type { AppData, AssignmentSuccess } from '../types'
-import { enumerateSwaps, type SwapCandidate, type SwapSide } from '../engine/swap'
+import { enumerateSwaps, type DiversityGuard, type SwapCandidate, type SwapSide } from '../engine/swap'
 
 interface SwapToolProps {
   data: AppData
   result: AssignmentSuccess
   onApply: (candidate: SwapCandidate) => void
+  /** 备选模式：保证互换后当前方案与其余方案差异条数不低于 N（单方案模式缺省） */
+  guard?: DiversityGuard
 }
 
 /**
  * 分派互换工具：选两位已有任务的评审人，列出其间全部合法一换一候选，
  * 预览交换前后稿件 / 命中标签 / 总匹配数变化，确认后只更新当前结果。
  */
-export function SwapTool({ data, result, onApply }: SwapToolProps) {
+export function SwapTool({ data, result, onApply, guard }: SwapToolProps) {
   const paperMap = useMemo(() => new Map(data.papers.map((p) => [p.id, p])), [data.papers])
   const reviewerMap = useMemo(() => new Map(data.reviewers.map((r) => [r.id, r])), [data.reviewers])
 
@@ -37,8 +39,8 @@ export function SwapTool({ data, result, onApply }: SwapToolProps) {
 
   const enumeration = useMemo(() => {
     if (!reviewerAId || !reviewerBId) return null
-    return enumerateSwaps(data, result, reviewerAId, reviewerBId)
-  }, [data, result, reviewerAId, reviewerBId])
+    return enumerateSwaps(data, result, reviewerAId, reviewerBId, guard)
+  }, [data, result, reviewerAId, reviewerBId, guard])
 
   const paperTitle = (id: string) => paperMap.get(id)?.title ?? id
   const reviewerName = (id: string) => reviewerMap.get(id)?.name ?? id
@@ -51,7 +53,13 @@ export function SwapTool({ data, result, onApply }: SwapToolProps) {
           选择两位<strong>已有任务</strong>的评审人，枚举其任务之间所有一换一候选；
           自动排除同稿（交换后组合不变）、交换后触发利益冲突、让同一评审人重复承担同一稿件、
           让<strong>同一稿件出现同一机构两位评审人</strong>（机构去重硬约束）的项，
-          以及<strong>预指派</strong>分派（硬约束不允许互换换走），
+          以及<strong>预指派</strong>分派（硬约束不允许互换换走）
+          {guard && guard.otherEdgeSets.length > 0 && (
+            <>
+              ；备选模式下还会排除让本方案与其余方案<strong>差异少于 {guard.minDifference} 条</strong>的互换
+            </>
+          )}
+          ，
           候选按主题匹配净增从高到低排列。确认后仅改派当前结果，录入数据不变。
         </p>
       </div>
@@ -126,12 +134,14 @@ export function SwapTool({ data, result, onApply }: SwapToolProps) {
               enumeration.excluded.conflict +
               enumeration.excluded.duplicate +
               enumeration.excluded.organization +
-              enumeration.excluded.preassigned >
+              enumeration.excluded.preassigned +
+              enumeration.excluded.diversity >
               0) && (
               <span className="muted">
                 （已排除：同稿/组合不变 {enumeration.excluded.samePaper}，利益冲突 {enumeration.excluded.conflict}
                 ，重复承担 {enumeration.excluded.duplicate}，同机构 {enumeration.excluded.organization}
-                ，预指派 {enumeration.excluded.preassigned}）
+                ，预指派 {enumeration.excluded.preassigned}
+                {enumeration.excluded.diversity > 0 && `，备选差异不足 ${enumeration.excluded.diversity}`}）
               </span>
             )}
           </div>

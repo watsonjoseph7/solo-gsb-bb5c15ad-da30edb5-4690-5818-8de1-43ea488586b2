@@ -12,7 +12,8 @@ import React from 'react'
 import { renderToString } from 'react-dom/server'
 import App from '../src/App'
 import { createSampleData } from '../src/sampleData'
-import { solveAssignment, computeMatchedTags } from '../src/engine/solver'
+import { solveAssignment, solveAssignmentBatch, computeMatchedTags } from '../src/engine/solver'
+import { symmetricDifference } from '../src/engine/alternatives'
 import { ResultPanel } from '../src/components/ResultPanel'
 import { PapersPanel } from '../src/components/PapersPanel'
 import { ReviewersPanel } from '../src/components/ReviewersPanel'
@@ -51,7 +52,7 @@ console.log('✓ 示例数据渲染成功，长度', html2.length)
   )
   if (!html3.includes('分派互换')) throw new Error('分派互换工具未渲染')
   if (!html3.includes('请选择')) throw new Error('评审人选择器未渲染')
-  if (!html3.includes('导出结果 JSON')) throw new Error('导出按钮未渲染')
+  if (!html3.includes('导出当前方案 JSON')) throw new Error('导出按钮未渲染')
   console.log('✓ 成功结果页（含分派互换）渲染成功，长度', html3.length)
 
   // 过期结果页：互换工具应暂停并提示
@@ -177,6 +178,62 @@ console.log('✓ 示例数据渲染成功，长度', html2.length)
   if (!dupHtml.includes('预指派机构重复')) throw new Error('未渲染机构重复原因标签')
   if (dupHtml.includes('assignee')) throw new Error('机构重复失败不应含分派结果')
   console.log('✓ 预指派同稿机构重复整体拒绝（列出机构与评审人）渲染成功')
+}
+
+// 备选方案：多方案批量结果渲染标签切换、对比统计与当前方案导出
+{
+  // 4 篇 ×2、6 位容量充足：可生成 3 个互不相同的方案
+  const data: AppData = {
+    papers: [
+      { id: 'p1', title: '稿件一', reviewsRequired: 2, tags: [] },
+      { id: 'p2', title: '稿件二', reviewsRequired: 2, tags: [] },
+      { id: 'p3', title: '稿件三', reviewsRequired: 2, tags: [] },
+      { id: 'p4', title: '稿件四', reviewsRequired: 2, tags: [] }
+    ],
+    reviewers: ['a', 'b', 'c', 'd', 'e', 'f'].map((id) => ({
+      id: 'r' + id,
+      name: '评审' + id.toUpperCase(),
+      organization: '',
+      tags: [],
+      capacity: 4,
+      conflictPaperIds: []
+    })),
+    preAssignments: []
+  }
+  const batch = solveAssignmentBatch(data, 3, 2)
+  if (!batch.feasible || (batch as { kind?: string }).kind !== 'batch') throw new Error('备选批量应成功')
+  const solutions = (batch as { solutions: any[] }).solutions
+  if (solutions.length !== 3) throw new Error('应生成 3 个备选方案')
+  const html = renderToString(
+    React.createElement(ResultPanel, { data, result: batch, stale: false, onExport: () => {}, onApplySwap: () => {} })
+  )
+  // React SSR 会在文本插值处插入 <!-- -->，断言前先去掉注释节点
+  const text = html.replace(/<!--[^>]*-->/g, '')
+  if (!text.includes('方案 1') || !text.includes('方案 2') || !text.includes('方案 3')) throw new Error('方案标签未全部渲染')
+  if (!text.includes('最优')) throw new Error('方案 1 的最优标记未渲染')
+  if (!text.includes('相对方案1差异')) throw new Error('差异条数统计未渲染')
+  if (!text.includes('导出当前方案 JSON')) throw new Error('当前方案导出按钮未渲染')
+  if (text.includes('已生成')) throw new Error('凑满数量时不应显示停止原因')
+  console.log('✓ 备选方案批量结果（标签/对比统计/导出）渲染成功')
+
+  // 两两差异均 ≥ N
+  for (let i = 0; i < 3; i++)
+    for (let j = i + 1; j < 3; j++)
+      if (symmetricDifference(solutions[i], solutions[j]) < 2) throw new Error('备选方案差异不足 N')
+
+  // 无法凑满：渲染停止原因横幅，但仍保留已找到方案
+  const limited: AppData = { papers: [{ id: 'q1', title: '独苗', reviewsRequired: 1, tags: [] }], reviewers: [
+    { id: 'x', name: 'X', organization: '', tags: [], capacity: 1, conflictPaperIds: [] },
+    { id: 'y', name: 'Y', organization: '', tags: [], capacity: 1, conflictPaperIds: [] }
+  ], preAssignments: [] }
+  const partial = solveAssignmentBatch(limited, 3, 2)
+  const partialRaw = renderToString(
+    React.createElement(ResultPanel, { data: limited, result: partial, stale: false, onExport: () => {}, onApplySwap: () => {} })
+  )
+  const partialHtml = partialRaw.replace(/<!--[^>]*-->/g, '')
+  if (!partialHtml.includes('停止')) throw new Error('未渲染备选停止原因')
+  if (!partialHtml.includes('方案 1') || !partialHtml.includes('方案 2')) throw new Error('已找到的方案未保留展示')
+  console.log('✓ 备选无法凑满（停止原因 + 保留方案）渲染成功')
 }
 
 // 旧数据兼容：localStorage 中没有 preAssignments 字段时，应用仍可正常渲染与求解

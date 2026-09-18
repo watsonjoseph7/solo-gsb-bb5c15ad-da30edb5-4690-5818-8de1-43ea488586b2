@@ -1,9 +1,11 @@
 import { useEffect, useMemo, useState } from 'react'
 import type { AppData, AssignmentResult, Paper, Reviewer, StressTestReport } from './types'
+import { isBatchResult } from './types'
 import { createId, loadData, saveData } from './storage'
-import { solveAssignment, evaluateHardConstraints } from './engine/solver'
+import { solveAssignmentBatch, evaluateHardConstraints } from './engine/solver'
 import { runStressTest, stressFingerprint } from './engine/stress'
-import { applySwapCandidate, type SwapCandidate } from './engine/swap'
+import { applySwapCandidate, type DiversityGuard, type SwapCandidate } from './engine/swap'
+import { assignmentEdges, symmetricDifference } from './engine/alternatives'
 import { createSampleData } from './sampleData'
 import { buildExportPayload, buildStressExportPayload, downloadJson } from './exporter'
 import { PapersPanel } from './components/PapersPanel'
@@ -16,6 +18,13 @@ type Tab = 'papers' | 'reviewers' | 'result' | 'stress'
 
 const EMPTY: AppData = { papers: [], reviewers: [], preAssignments: [] }
 
+/** 备选模式表单参数（默认 1 个方案，保持现有单方案行为） */
+interface GenerateOptions {
+  count: number
+  /** N 的文本输入，失焦/生成时再解析校验 */
+  minDifferenceText: string
+}
+
 export default function App() {
   const [data, setData] = useState<AppData>(() => loadData() ?? EMPTY)
   const [tab, setTab] = useState<Tab>('papers')
@@ -23,6 +32,8 @@ export default function App() {
   const [stale, setStale] = useState(false)
   const [solving, setSolving] = useState(false)
   const [solveMillis, setSolveMillis] = useState<number | null>(null)
+  const [options, setOptions] = useState<GenerateOptions>({ count: 1, minDifferenceText: '2' })
+  const [activePlanIndex, setActivePlanIndex] = useState(0)
   const [stressReport, setStressReport] = useState<StressTestReport | null>(null)
   const [stressRunning, setStressRunning] = useState(false)
 
@@ -63,13 +74,23 @@ export default function App() {
     setData((d) => ({ ...d, preAssignments: d.preAssignments.filter((pa) => pa.id !== id) }))
 
   const generate = () => {
+    // 备选模式参数校验（count=1 时不需要 N，保持单方案默认行为）
+    if (options.count > 1) {
+      const parsed = Number(options.minDifferenceText)
+      if (!/^\d+$/.test(options.minDifferenceText.trim()) || !Number.isInteger(parsed) || parsed < 1) {
+        window.alert('请输入不小于 1 的整数作为最小差异条数 N。')
+        return
+      }
+    }
     // 让“求解中”状态先渲染，再执行同步求解（大规模 ILP 可能耗时数百毫秒至数秒）
     setSolving(true)
     setTimeout(() => {
       const t0 = performance.now()
-      const r = solveAssignment(data)
+      const n = options.count > 1 ? Math.max(1, parseInt(options.minDifferenceText.trim(), 10)) : 0
+      const r = solveAssignmentBatch(data, options.count, n)
       setSolveMillis(Math.round(performance.now() - t0))
       setResult(r)
+      setActivePlanIndex(0)
       setStale(false)
       setSolving(false)
       setTab('result')
@@ -104,16 +125,54 @@ export default function App() {
     setStressReport(null)
   }
 
-  const exportResult = () => {
-    if (result?.feasible) downloadJson(buildExportPayload(data, result))
+  // 导出当前选中方案：批量结果时写入方案序号、总数、N 与相对方案 1 的差异条数
+  const exportResult = (planIndex = 0) => {
+    if (!result?.feasible) return
+    if (isBatchResult(result)) {
+      const batch = result
+      const i = Math.min(planIndex, batch.solutions.length - 1)
+      const current = batch.solutions[i]
+      const diffToFirst = i === 0 ? 0 : symmetricDifference(batch.solutions[0], current)
+      downloadJson(
+        buildExportPayload(data, current, {
+          index: i + 1,
+          total: batch.solutions.length,
+          minDifference: batch.minDifference,
+          diffToFirst
+        }),
+        undefined
+      )
+    } else {
+      downloadJson(buildExportPayload(data, result))
+    }
   }
 
   // 确认一次一换一：仅在结果层改派（不改录入数据）。
   // 成功后结果仍是“成功且未过期”，并被标记为已人工调整；stale 保持 false。
+  // 备选模式下传入多样性守卫，确保改派后与其余方案的差异条数不低于 N。
   const applySwap = (candidate: SwapCandidate) => {
     if (!result?.feasible || stale) return
-    const next = applySwapCandidate(data, result, candidate)
-    if (next) setResult(next)
+    if (isBatchResult(result)) {
+      const batch = result
+      const i = Math.min(activePlanIndex, batch.solutions.length - 1)
+      const current = batch.solutions[i]
+      const guard: DiversityGuard = {
+        minDifference: batch.minDifference,
+        otherEdgeSets: batch.solutions
+          .map((s, k) => (k === i ? null : assignmentEdges(s)))
+          .filter((e): e is Set<string> => e !== null)
+      }
+      const next = applySwapCandidate(data, current, candidate, guard)
+      if (next) {
+        const solutions = batch.solutions.slice()
+        solutions[i] = next
+        setResult({ ...batch, solutions })
+      }
+    } else {
+      const single = result as Extract<AssignmentResult, { feasible: true; kind?: undefined }>
+      const next = applySwapCandidate(data, single, candidate)
+      if (next) setResult(next)
+    }
   }
 
   const exportStress = () => {
@@ -125,6 +184,19 @@ export default function App() {
 
   const totalRequired = data.papers.reduce((a, p) => a + Math.max(0, p.reviewsRequired || 0), 0)
   const totalCapacity = data.reviewers.reduce((a, r) => a + Math.max(0, r.capacity || 0), 0)
+
+  // 备选模式：N 的上界 = 2 ×（总名额 − 预指派数），预指派在所有方案中必须相同
+  const diffUpperBound = Math.max(0, 2 * (baseline.totalRequired - baseline.forced.forcedKeys.size))
+  const nParse = options.count > 1 ? Number(options.minDifferenceText.trim()) : NaN
+  const nInvalid =
+    options.count > 1 &&
+    (!/^\d+$/.test(options.minDifferenceText.trim()) || !Number.isInteger(nParse) || nParse < 1 || nParse > diffUpperBound)
+  const nHint =
+    options.count > 1 && !/^\d+$/.test(options.minDifferenceText.trim())
+      ? 'N 必须是不小于 1 的整数'
+      : options.count > 1 && Number.isInteger(nParse) && nParse > diffUpperBound
+        ? `N 不能超过 ${diffUpperBound}（2 × 自由关系数；预指派 ${baseline.forced.forcedKeys.size} 条不可变）`
+        : ''
 
   return (
     <div className="app">
@@ -146,10 +218,47 @@ export default function App() {
           <button className="btn btn-ghost danger" onClick={clearAll}>
             清空
           </button>
-          <button className="btn btn-generate" onClick={generate} disabled={data.papers.length === 0 || solving}>
+          <div className="generate-options" title="备选方案：生成 1～3 个满足全部硬约束的方案；第 1 个为字典序最优，其余方案与已生成方案至少相差 N 条关系">
+            <label className="gen-option">
+              <span className="gen-option-label">方案数</span>
+              <select
+                className="input gen-select"
+                value={options.count}
+                onChange={(e) => setOptions((o) => ({ ...o, count: parseInt(e.target.value, 10) }))}
+              >
+                <option value={1}>1（默认）</option>
+                <option value={2}>2</option>
+                <option value={3}>3</option>
+              </select>
+            </label>
+            {options.count > 1 && (
+              <label className={`gen-option ${nInvalid ? 'gen-option--bad' : ''}`}>
+                <span className="gen-option-label">最少差异 N</span>
+                <input
+                  className="input gen-n-input"
+                  type="number"
+                  min={1}
+                  max={diffUpperBound || undefined}
+                  step={2}
+                  value={options.minDifferenceText}
+                  onChange={(e) => setOptions((o) => ({ ...o, minDifferenceText: e.target.value }))}
+                />
+                <span className="gen-option-hint">
+                  条（对称差，偶数；上界 {diffUpperBound}）
+                </span>
+              </label>
+            )}
+          </div>
+          <button
+            className="btn btn-generate"
+            onClick={generate}
+            disabled={data.papers.length === 0 || solving || !!nInvalid}
+            title={nInvalid ? nHint : undefined}
+          >
             {solving ? '⏳ 本地求解中…' : '▶ 生成分派'}
           </button>
         </div>
+        {options.count > 1 && nHint && <div className="gen-options-error">⚠ {nHint}</div>}
       </header>
 
       <nav className="tabs">
@@ -189,7 +298,15 @@ export default function App() {
               <p>⏳ 正在浏览器本地进行整数规划求解，请稍候…</p>
             </section>
           ) : (
-            <ResultPanel data={data} result={result} stale={stale} onExport={exportResult} onApplySwap={applySwap} />
+            <ResultPanel
+              data={data}
+              result={result}
+              stale={stale}
+              onExport={exportResult}
+              onApplySwap={applySwap}
+              activeIndex={activePlanIndex}
+              onActiveIndexChange={setActivePlanIndex}
+            />
           ))}
         {tab === 'stress' && (
           <StressPanel

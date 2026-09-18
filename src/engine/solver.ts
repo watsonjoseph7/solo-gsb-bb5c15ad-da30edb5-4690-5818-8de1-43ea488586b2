@@ -1,6 +1,7 @@
 import solver from 'javascript-lp-solver'
 import { checkFeasibility, orgAwareCapacityForPaperGroup } from './maxflow'
 import { buildForcedMatrix, dedupePreAssignments, validatePreAssignments, type ForcedMatrix } from './preassign'
+import { symmetricDifferenceOfEdges, validateBatchOptions } from './alternatives'
 import type {
   AppData,
   AssignmentItem,
@@ -395,10 +396,126 @@ export function solveAssignment(rawData: AppData): AssignmentResult {
   }
 
   // ---- 硬约束可行：用整数规划做目标优化（预指派关系作为强制变量） ----
-  return optimize(hc.papers, hc.reviewers, hc.eligible, hc.organizations, hc.demands, hc.totalRequired, hc.forced)
+  // 单方案模式不带多样性切割，最大流已保证可行，optimize 不会返回 null
+  return optimize(hc.papers, hc.reviewers, hc.eligible, hc.organizations, hc.demands, hc.totalRequired, hc.forced)!
+}
+
+/**
+ * 备选方案批量入口。
+ *
+ * requestedCount 为用户选择的方案数（1～3），minDifference 为用户输入并校验过的 N：
+ *  - 第 1 个方案与单方案模式完全一致（字典序：主题匹配最大化 → 最大负载最小化）；
+ *  - 第 k（k ≥ 2）个方案必须满足全部硬约束，且与已生成的每个方案的关系对称差 ≥ N。
+ *    求解时把每个旧方案作为一条多样性切割加入同一 ILP（仍按字典序选最优的合格备选）。
+ *  - 若不存在满足切割的方案，则停止生成并说明原因；已找到的方案全部保留。
+ *
+ * requestedCount === 1 时退化为 {@link solveAssignment}（返回普通 AssignmentSuccess，
+ * 保持现有单方案默认行为与导出/互换逻辑完全不变）。
+ */
+export function solveAssignmentBatch(
+  rawData: AppData,
+  requestedCount: number,
+  minDifference: number
+): AssignmentResult {
+  const count = Math.floor(requestedCount)
+  if (!Number.isInteger(requestedCount) || count < 1 || count > 3) {
+    return { feasible: false, reasons: [{ kind: 'paper-eligible', message: '方案数量必须是 1～3 之间的整数。' }] }
+  }
+  if (count === 1) return solveAssignment(rawData)
+
+  // ---- 硬约束可行性（与单方案同源；不可行时不产生任何部分结果） ----
+  const hc = evaluateHardConstraints(rawData)
+  if (!hc.feasible) {
+    return { feasible: false, reasons: hc.reasons }
+  }
+
+  const { papers, reviewers, eligible, organizations, demands, totalRequired, forced } = hc
+
+  // 第 1 个方案：现有字典序最优
+  const first = optimize(papers, reviewers, eligible, organizations, demands, totalRequired, forced)
+  if (!first) {
+    // 理论不可达（最大流已保证无切割可行）；防御性失败
+    return { feasible: false, reasons: [{ kind: 'subset-bottleneck', message: '首方案求解失败，请重试。' }] }
+  }
+
+  // 参数校验（N 为正整数且不超过当前数据的可实现上界）
+  const validation = validateBatchOptions({ requestedCount: count, minDifferenceInput: minDifference, reference: first })
+  if (!validation.ok) {
+    return { feasible: false, reasons: [{ kind: 'paper-eligible', message: validation.message }] }
+  }
+  const N = validation.minDifference
+
+  const solutions: AssignmentSuccess[] = [first]
+  const edgeSets: Set<string>[] = []
+  {
+    // 用局部下标键构造切割（forced 下标在方案间一致，自由边按下标比对）
+    const paperIndex = forced.paperIndex
+    const reviewerIndex = forced.reviewerIndex
+    const edges = new Set<string>()
+    for (const a of first.assignments) {
+      const i = paperIndex.get(a.paperId)
+      const j = reviewerIndex.get(a.reviewerId)
+      if (i !== undefined && j !== undefined) edges.add(`${i}_${j}`)
+    }
+    edgeSets.push(edges)
+  }
+
+  let stopReason: string | undefined
+  for (let k = 1; k < count; k++) {
+    // 与“已生成的每个方案”至少相差 N 条关系
+    const cuts: DiversityCut[] = edgeSets.map((keys) => ({ keys, minSymmetricDifference: N }))
+    const candidate = optimize(papers, reviewers, eligible, organizations, demands, totalRequired, forced, cuts)
+    if (!candidate) {
+      const found = solutions.length
+      stopReason =
+        `已生成 ${found} 个方案后停止：在满足全部硬约束的前提下，找不到与已生成的每个方案` +
+        `都至少相差 ${N} 条稿件—评审人关系的第 ${found + 1} 个方案（第 ${found + 1} 次整数规划在全部多样性约束下不可行）。` +
+        `已找到的 ${found} 个方案全部保留；可调小差异条数 N、减少预指派或放宽容量后重试。`
+      break
+    }
+    // 防御性复核：用全局关系集合再算一次对称差，确保与每个旧方案都达到 N
+    const candidateEdges = new Set<string>()
+    for (const a of candidate.assignments) candidateEdges.add(`${a.paperId}␟${a.reviewerId}`)
+    let violated = false
+    for (let s = 0; s < solutions.length; s++) {
+      const prev = new Set<string>()
+      for (const a of solutions[s].assignments) prev.add(`${a.paperId}␟${a.reviewerId}`)
+      if (symmetricDifferenceOfEdges(candidateEdges, prev) < N) {
+        violated = true
+        break
+      }
+    }
+    if (violated) {
+      stopReason =
+        `已生成 ${solutions.length} 个方案后停止：求解器返回的候选未能通过差异条数复核（少于 ${N} 条）。` +
+        `已找到的 ${solutions.length} 个方案全部保留。`
+      break
+    }
+    // 记录局部下标键，供下一轮切割使用
+    const localKeys = new Set<string>()
+    for (const a of candidate.assignments) {
+      const i = forced.paperIndex.get(a.paperId)
+      const j = forced.reviewerIndex.get(a.reviewerId)
+      if (i !== undefined && j !== undefined) localKeys.add(`${i}_${j}`)
+    }
+    edgeSets.push(localKeys)
+    solutions.push(candidate)
+  }
+
+  return { feasible: true, kind: 'batch', requestedCount: count, minDifference: N, solutions, stopReason }
 }
 
 /* ------------------------------ 整数规划优化 ------------------------------ */
+
+/**
+ * 备选方案多样性切割（diversity cut）：新方案相对某个已生成方案必须至少有
+ * {@link minSymmetricDifference} 条关系（对称差）不同。
+ * keys 为旧方案选中的局部变量下标键 "i_j"。
+ */
+export interface DiversityCut {
+  keys: Set<string>
+  minSymmetricDifference: number
+}
 
 interface PhaseSolution {
   feasible: boolean
@@ -415,6 +532,10 @@ interface PhaseSolution {
  * LP 松弛的顶点解天然为整数，javascript-lp-solver 无需真正分支即可快速求得 0/1 最优解。
  * 机构去重以“每（稿件,非空机构）Σ x ≤ 1”的行约束加入（机构成员节点-关联阵依旧全幺模）；
  * 空机构不生成此类约束，因此空值仅代表本人。
+ *
+ * cuts（备选方案模式）为每个已生成方案增加一行“不得重复多于 T−⌈N/2⌉ 条旧关系”：
+ * 两方案分派总数相同，对称差 = 2 × 仅属于其一的关系数，⌈N/2⌉ 即单侧最少不同数。
+ * 加入切割行后矩阵不再保证全幺模，求解器按需做整数分支（规模仍为同一数量级）。
  */
 function runPhase(
   papers: Paper[],
@@ -424,7 +545,8 @@ function runPhase(
   demands: number[],
   totalRequired: number,
   capLimit: number | null,
-  forced: ForcedMatrix
+  forced: ForcedMatrix,
+  cuts: DiversityCut[] = []
 ): PhaseSolution {
   const P = papers.length
   const R = reviewers.length
@@ -453,6 +575,11 @@ function runPhase(
   for (const key of forced.forcedKeys) {
     model.constraints[`pre_${key}`] = { equal: 1 }
   }
+  // 备选方案多样性：相对每个旧方案的重叠关系数不得超过 T − ⌈N/2⌉。
+  // 预指派变量在每个方案中都为 1，计入切割上界但天然贡献满额重叠，不影响可行性。
+  cuts.forEach((cut, ci) => {
+    model.constraints[`cut_${ci}`] = { max: totalRequired - Math.ceil(cut.minSymmetricDifference / 2) }
+  })
   // 机构去重硬约束：每个（稿件 i，非空机构 o）一行，Σ_j∈org(o) x[i][j] ≤ 1。
   // 空机构不生成行（空值仅代表本人，互不合并）；机构名按去首尾空白后的精确值分组（区分大小写）。
   const distinctOrgs: string[] = []
@@ -487,6 +614,10 @@ function runPhase(
       if (organizations[j]) {
         model.variables[varName][`org_${i}_${organizations[j]}`] = 1
       }
+      // 多样性切割行：仅在旧方案中出现的变量系数为 1
+      cuts.forEach((cut, ci) => {
+        if (cut.keys.has(`${i}_${j}`)) model.variables[varName][`cut_${ci}`] = 1
+      })
     }
   }
 
@@ -563,16 +694,19 @@ function optimize(
   organizations: string[],
   demands: number[],
   totalRequired: number,
-  forced: ForcedMatrix
-): AssignmentSuccess {
+  forced: ForcedMatrix,
+  cuts: DiversityCut[] = []
+): AssignmentSuccess | null {
   const R = reviewers.length
+  const hasCuts = cuts.length > 0
 
   // 阶段一：真实容量下最大化主题匹配数（预指派变量固定为 1），得到最优匹配数 M*
-  const phase1 = runPhase(papers, reviewers, eligible, organizations, demands, totalRequired, null, forced)
+  const phase1 = runPhase(papers, reviewers, eligible, organizations, demands, totalRequired, null, forced, cuts)
 
-  // 理论上最大流已保证可行；求解器异常时退回贪心可行解
+  // 无切割时：理论上最大流已保证可行，求解器异常可退回贪心可行解；
+  // 带多样性切割时“不可行”是停止找备选的正常信号，且贪心不保证满足切割，只能返回 null。
   if (!phase1.feasible) {
-    return greedyFallback(papers, reviewers, eligible, organizations, demands, totalRequired, forced)
+    return hasCuts ? null : greedyFallback(papers, reviewers, eligible, organizations, demands, totalRequired, forced)
   }
   const bestMatches = phase1.matches
   let bestRaw = phase1.raw
@@ -588,7 +722,7 @@ function optimize(
 
   while (lo < hi) {
     const mid = (lo + hi) >> 1
-    const r = runPhase(papers, reviewers, eligible, organizations, demands, totalRequired, mid, forced)
+    const r = runPhase(papers, reviewers, eligible, organizations, demands, totalRequired, mid, forced, cuts)
     if (r.feasible && r.matches === bestMatches) {
       hi = mid
       bestRaw = r.raw
@@ -599,18 +733,18 @@ function optimize(
 
   const assignments = parseSolution(papers, reviewers, eligible, bestRaw, forced)
   if (assignments.length !== totalRequired) {
-    return greedyFallback(papers, reviewers, eligible, organizations, demands, totalRequired, forced)
+    return hasCuts ? null : greedyFallback(papers, reviewers, eligible, organizations, demands, totalRequired, forced)
   }
   // 防御性校验：求解结果必须完整包含全部预指派
   for (const key of forced.forcedKeys) {
     const [i, j] = key.split('_').map(Number)
     if (!assignments.some((a) => a.paperId === papers[i].id && a.reviewerId === reviewers[j].id)) {
-      return greedyFallback(papers, reviewers, eligible, organizations, demands, totalRequired, forced)
+      return hasCuts ? null : greedyFallback(papers, reviewers, eligible, organizations, demands, totalRequired, forced)
     }
   }
   // 防御性校验：同一篇稿件不得出现同一机构两人（机构去重硬约束，空机构除外）
   if (hasDuplicateOrganization(papers, reviewers, assignments)) {
-    return greedyFallback(papers, reviewers, eligible, organizations, demands, totalRequired, forced)
+    return hasCuts ? null : greedyFallback(papers, reviewers, eligible, organizations, demands, totalRequired, forced)
   }
   return buildSuccess(reviewers, assignments, totalRequired)
 }
