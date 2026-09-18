@@ -1,0 +1,277 @@
+import type { AppData, AssignmentResult } from '../types'
+import type { SwapCandidate } from '../engine/swap'
+import { SwapTool } from './SwapTool'
+
+interface ResultPanelProps {
+  data: AppData
+  result: AssignmentResult | null
+  /** 当前结果是否因录入数据变化而已过期（过期时不允许互换） */
+  stale: boolean
+  onExport: () => void
+  onApplySwap: (candidate: SwapCandidate) => void
+}
+
+const kindLabel: Record<string, string> = {
+  'global-capacity': '全局容量不足',
+  'paper-eligible': '单篇稿件可分配人数不足',
+  'subset-bottleneck': '组合性瓶颈（局部容量不足）',
+  preassignment: '预指派硬约束无法满足'
+}
+
+const issueLabel: Record<string, string> = {
+  'paper-missing': '引用稿件不存在',
+  'reviewer-missing': '引用评审人不存在',
+  conflict: '与利益冲突冲突',
+  'organization-duplicate': '预指派机构重复',
+  'paper-overflow': '同篇预指派超过名额',
+  'reviewer-overload': '单人预占超过容量'
+}
+
+export function ResultPanel({ data, result, stale, onExport, onApplySwap }: ResultPanelProps) {
+  if (!result) {
+    return (
+      <section className="result-empty">
+        <p>点击页面顶部的「▶ 生成分派」按钮，系统将在浏览器本地完成整数规划求解。</p>
+        <ul>
+          <li>
+            <strong>硬约束</strong>：预指派必须入选、利益冲突回避、评审人容量上限、每篇稿件所需评审人数、
+            同一篇稿件对每个机构至多选择一人（空机构除外），五者必须全部满足；
+          </li>
+          <li>
+            <strong>优化目标</strong>：先最大化主题标签匹配，再最小化评审人最大负载（负载均衡）。
+          </li>
+        </ul>
+      </section>
+    )
+  }
+
+  if (!result.feasible) {
+    const preReason = result.reasons.find((r) => r.kind === 'preassignment')
+    return (
+      <section>
+        <div className="result-banner result-banner--fail">
+          <h2>✕ 无法生成可行分配</h2>
+          <p>以下硬约束无法同时满足，请按提示调整数据后重新生成（不会生成任何部分结果）：</p>
+        </div>
+        {preReason?.issues && preReason.issues.length > 0 && (
+          <div className="reason-list">
+            <div className="reason-card preassignment-reason-card">
+              <span className="reason-kind">{kindLabel.preassignment}</span>
+              <p className="reason-message">{preReason.message}</p>
+              {(() => {
+                const hasOrgIssues = preReason.issues.some((iss) => iss.organization)
+                return (
+                  <div
+                    className="preassign-issue-table"
+                  >
+                    <div
+                      className={`preassign-issue-row preassign-issue-head ${hasOrgIssues ? 'preassign-issue-row--org' : ''}`}
+                    >
+                      <span>稿件</span>
+                      {hasOrgIssues && <span>机构</span>}
+                      <span>评审人</span>
+                      <span>原因</span>
+                    </div>
+                    {preReason.issues.map((iss) => (
+                      <div
+                        className={`preassign-issue-row ${hasOrgIssues ? 'preassign-issue-row--org' : ''}`}
+                        key={iss.preAssignmentId}
+                      >
+                        <span>{iss.paperTitle ? `《${iss.paperTitle}》` : `（已删除：${iss.paperId ?? '—'}）`}</span>
+                        {hasOrgIssues && (
+                          <span>
+                            {iss.organization ? (
+                              <span className="stress-chip stress-chip--amber org-chip">🏛 {iss.organization}</span>
+                            ) : (
+                              <span className="muted">—</span>
+                            )}
+                          </span>
+                        )}
+                        <span>
+                          {iss.reviewerName ?? `（已删除：${iss.reviewerId ?? '—'}）`}
+                          {iss.organizationReviewerNames && iss.organizationReviewerNames.length > 1 && (
+                            <em className="muted preassign-issue-detail">
+                              同稿同机构：{iss.organizationReviewerNames.join('、')}
+                            </em>
+                          )}
+                        </span>
+                        <span>
+                          <span className="stress-chip stress-chip--red">{issueLabel[iss.reason] ?? iss.reason}</span>
+                          <span className="muted preassign-issue-detail">{iss.message}</span>
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                )
+              })()}
+            </div>
+            {result.reasons
+              .filter((r) => r.kind !== 'preassignment')
+              .map((r, i) => (
+                <div className="reason-card" key={i}>
+                  <span className="reason-kind">{kindLabel[r.kind] ?? r.kind}</span>
+                  <p className="reason-message">{r.message}</p>
+                </div>
+              ))}
+          </div>
+        )}
+        {!preReason && (
+          <div className="reason-list">
+            {result.reasons.map((r, i) => (
+              <div className="reason-card" key={i}>
+                <span className="reason-kind">{kindLabel[r.kind] ?? r.kind}</span>
+                <p className="reason-message">{r.message}</p>
+              </div>
+            ))}
+          </div>
+        )}
+      </section>
+    )
+  }
+
+  const reviewerMap = new Map(data.reviewers.map((r) => [r.id, r]))
+  const byPaper = new Map<string, typeof result.assignments>()
+  for (const a of result.assignments) {
+    const list = byPaper.get(a.paperId) ?? []
+    list.push(a)
+    byPaper.set(a.paperId, list)
+  }
+
+  const { totalRequired, totalAssigned, topicMatches, maxLoad, preassignedCount } = result.objective
+
+  return (
+    <section>
+      <div className="result-banner result-banner--ok">
+        <h2>
+          ✓ 分配完成
+          {result.manuallyAdjusted && (
+            <span className="manual-badge" title={`已通过「分派互换」人工调整 ${result.swapCount ?? 0} 次；录入数据未改动`}>
+              ✎ 已人工调整
+            </span>
+          )}
+        </h2>
+        <div className="stat-row">
+          <div className="stat">
+            <strong>{totalAssigned}/{totalRequired}</strong>
+            <span>分配名额</span>
+          </div>
+          <div className="stat">
+            <strong>{topicMatches}</strong>
+            <span>主题匹配数</span>
+          </div>
+          <div className="stat">
+            <strong>{maxLoad}</strong>
+            <span>评审人最大负载</span>
+          </div>
+          <div className="stat">
+            <strong className={preassignedCount > 0 ? 'stat-pre' : undefined}>{preassignedCount}</strong>
+            <span>来自预指派</span>
+          </div>
+        </div>
+        <button className="btn btn-primary" onClick={onExport}>
+          ⬇ 导出结果 JSON
+        </button>
+      </div>
+
+      {stale ? (
+        <div className="stress-stale-banner">
+          ⚠ 录入数据在生成本结果后已变化，当前分派<strong>可能已过期</strong>。
+          为避免在过期方案上误改派，「分派互换」已暂停；请点击页面顶部「▶ 生成分派」刷新结果后再操作。
+        </div>
+      ) : (
+        <SwapTool data={data} result={result} onApply={onApplySwap} />
+      )}
+
+      <h3 className="subhead">逐稿分配明细</h3>
+      <div className="card-list">
+        {data.papers
+          .filter((p) => p.reviewsRequired > 0)
+          .map((p) => {
+            const items = byPaper.get(p.id) ?? []
+            return (
+              <div className="card assignment-card" key={p.id}>
+                <div className="assignment-title">
+                  <span className="paper-title">{p.title || p.id}</span>
+                  <span className="muted">
+                    需 {p.reviewsRequired} 人 · 已分配 {items.length} 人
+                  </span>
+                  <div className="mini-tags">
+                    {p.tags.map((t) => (
+                      <span className="mini-tag mini-tag--blue" key={t}>
+                        {t}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+                <div className="assignee-list">
+                  {items.map((a) => {
+                    const rv = reviewerMap.get(a.reviewerId)
+                    return (
+                      <div className={`assignee ${a.topicMatched ? 'is-match' : 'is-nomatch'}`} key={a.reviewerId}>
+                        <span className="assignee-name">
+                          {rv?.name ?? a.reviewerId}
+                          {rv && (rv.organization ?? '').trim() && (
+                            <em className="assignee-org" title="评审人机构（同一稿件每机构至多一人）">
+                              🏛 {(rv.organization ?? '').trim()}
+                            </em>
+                          )}
+                        </span>
+                        {a.preassigned ? (
+                          <span className="badge badge-preassigned" title="该分派来自稿件编辑区的预指派（硬约束）">
+                            📌 预指派
+                          </span>
+                        ) : null}
+                        {a.topicMatched ? (
+                          <span className="badge badge-match">主题匹配</span>
+                        ) : (
+                          <span className="badge badge-nomatch">无直接匹配</span>
+                        )}
+                        {a.matchedTags.length > 0 && (
+                          <div className="mini-tags">
+                            {a.matchedTags.map((t) => (
+                              <span className="mini-tag mini-tag--green" key={t}>
+                                {t}
+                              </span>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    )
+                  })}
+                </div>
+              </div>
+            )
+          })}
+      </div>
+
+      <h3 className="subhead">评审人负载</h3>
+      <div className="load-list">
+        {result.loads.map((l) => {
+          const rv = reviewerMap.get(l.reviewerId)
+          const pct = l.capacity > 0 ? Math.round((l.assigned / l.capacity) * 100) : 0
+          const forcedCount = result.assignments.filter(
+            (a) => a.reviewerId === l.reviewerId && a.preassigned === true
+          ).length
+          return (
+            <div className="load-row" key={l.reviewerId}>
+              <span className="load-name" title={rv?.name}>
+                {rv?.name ?? l.reviewerId}
+                {rv && (rv.organization ?? '').trim() && <em className="load-org" title="评审人机构">🏛 {(rv.organization ?? '').trim()}</em>}
+                {forcedCount > 0 && <em className="load-preassigned" title="其中来自预指派的名额">📌 {forcedCount}</em>}
+              </span>
+              <div className="load-bar">
+                <div
+                  className={`load-fill ${pct >= 100 ? 'full' : pct >= 70 ? 'high' : ''}`}
+                  style={{ width: `${Math.min(100, pct)}%` }}
+                />
+              </div>
+              <span className="load-num">
+                {l.assigned}/{l.capacity}
+              </span>
+            </div>
+          )
+        })}
+      </div>
+    </section>
+  )
+}
